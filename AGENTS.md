@@ -1,32 +1,26 @@
 # AI Agent Guidelines
 
-Full-stack React SSR app built with TanStack Router (file-based routing) and Hono (server + SSR), using Vite+ and TypeScript.
+Full-stack React SSR app — TanStack Router (file-based routing) + Hono (server/SSR) + Vite+ + TypeScript.
 
 ## Essentials
 
-- Package manager: use `vp` (Vite+ CLI) — do not call `npm`/`npx` directly
-- Do not edit `src/routeTree.gen.ts` (auto-generated)
-- Routes live in `src/routes/` (file-based)
-- SSR server entry: `src/entry-server.tsx`; client entry: `src/entry-client.tsx`
-- Build commands:
-  - `vp run build` — runs `build:client` then `build:server` (both use `vp build` internally)
-  - `vp check` — format (Oxfmt) + lint (Oxlint) + type-check (tsgo) in one pass
-  - `vp test` — run all tests (single-run mode)
-- Linting/formatting: Oxlint + Oxfmt (configured in `vite.config.ts`, **no** separate eslint/prettier files)
+- Package manager: `vp` — never call `npm`/`pnpm`/`yarn` for installs or tooling (`npm start` for running the built server is fine)
+- Never edit `src/routeTree.gen.ts` (auto-generated)
+- `vp run build` — build client + server | `vp check` — format + lint + typecheck | `vp test` — run tests
 
-## More Detailed Guides
+## Guides
 
-- Index: `docs/ai/README.md`
-- Commands: `docs/ai/commands.md`
-- Architecture + entry points: `docs/ai/architecture.md`
-- Routing + data loading: `docs/ai/routing-and-data.md`
-- Server/API patterns (Hono): `docs/ai/server-api.md`
-- Environment variables: `docs/ai/environment.md`
-- Styling (Tailwind): `docs/ai/styling.md`
-- Code style + conventions: `docs/ai/code-style.md`
-- Testing: `docs/ai/testing.md`
-- Performance + deployment notes: `docs/ai/deployment.md`
-- Common pitfalls: `docs/ai/pitfalls.md`
+- [Commands](docs/ai/commands.md) — dev, build, lint, test
+- [Architecture](docs/ai/architecture.md) — entry points, request flow, project structure
+- [Routing & Data](docs/ai/routing-and-data.md) — file-based routes, loaders, TanStack Query
+- [Server/API](docs/ai/server-api.md) — Hono routes, RPC client
+- [Code Style](docs/ai/code-style.md) — conventions, imports, naming
+- [Testing](docs/ai/testing.md) — Vitest setup, jsdom, globals
+- [Environment Variables](docs/ai/environment.md) — VITE_ prefix, access patterns
+- [Styling](docs/ai/styling.md) — Tailwind CSS v4
+- [Streaming SSR](docs/ai/streaming.md) — optional, deferred data
+- [Deployment](docs/ai/deployment.md) — build outputs, production targets
+- [Pitfalls](docs/ai/pitfalls.md) — top 3 common mistakes
 
 <!--VITE PLUS START-->
 

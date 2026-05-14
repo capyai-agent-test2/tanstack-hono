@@ -24,5 +24,4 @@ This repo is a full-stack React SSR app built with TanStack Router (file-based r
 
 ## More Detail
 
-- Deep dive: `docs/architecture/deep-dive.md`
-- AI-focused architecture notes: `docs/ai/architecture.md`
+- Full working notes: [docs/ai/architecture.md](docs/ai/architecture.md)

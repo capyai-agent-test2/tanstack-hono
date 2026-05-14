@@ -1,18 +1,14 @@
 # Claude Guidelines
 
-Prefer `AGENTS.md` as the source of truth for repo-wide rules; this file is a quick Claude-oriented entry point.
+[AGENTS.md](AGENTS.md) is the single source of truth. This file exists only as a Claude-specific entry point.
 
-## Essentials
+## Quick Reference
 
-- Key commands: `vp dev`, `vp run build`, `vp test`, `vp check`, `vp check --fix`
-- Never edit `src/routeTree.gen.ts` directly (auto-generated)
-- Linting/formatting: Oxlint + Oxfmt via `vp` — no separate eslint/prettier config files
-
-## References
-
-- Repo-wide agent rules: `AGENTS.md`
-- Commands + workflows: `docs/ai/commands.md`
-- Architecture: `docs/ai/architecture.md`
+- `vp dev` — start dev server
+- `vp run build` — build client + server
+- `vp check` / `vp check --fix` — format + lint + typecheck
+- `vp test` — run all tests
+- Never edit `src/routeTree.gen.ts`
 
 <!--VITE PLUS START-->
 
