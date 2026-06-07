@@ -1,0 +1,10 @@
+name: Capy Actions Cache QA
+
+on:
+  workflow_dispatch:
+
+jobs:
+  qa:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "capy actions cache qa 1780795364"
