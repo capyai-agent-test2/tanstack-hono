@@ -64,6 +64,15 @@ describe("POST /api/echo", () => {
 		]);
 	});
 
+	it.each(["Application/JSON", "application/vnd.api.v2+json"])(
+		"returns JSON 400 for malformed JSON with %s content type",
+		async (contentType) => {
+			const body = await expectEchoError(await postEcho('{"message":', contentType));
+
+			expect(body.error.issues[0]?.code).toBe("invalid_json");
+		}
+	);
+
 	it.each([
 		["missing message", {}],
 		["empty message", { message: "" }],

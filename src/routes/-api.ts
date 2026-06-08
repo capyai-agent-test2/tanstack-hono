@@ -22,7 +22,7 @@ const echoValidationError = (c: Context, issues: EchoValidationIssue[]) =>
 		400
 	);
 
-const jsonContentTypeRegex = /^application\/([a-z-.]+\+)?json(;\s*[a-zA-Z0-9-]+=([^;]+))*$/;
+const jsonContentTypeRegex = /^application\/([a-z0-9-.]+\+)?json(\s*;\s*[a-zA-Z0-9-]+=([^;]+))*$/i;
 
 const echoJsonErrorMiddleware = createMiddleware(async (c, next) => {
 	const contentType = c.req.header("Content-Type");
