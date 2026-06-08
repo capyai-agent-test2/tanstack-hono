@@ -21,7 +21,9 @@ curl -fsS https://your-app.example.com/api/health
 ## Release Readiness
 
 - Use `GET /api/release-readiness` immediately before promoting a build or
-  opening traffic to a new environment.
+  opening traffic to a new environment once that endpoint is deployed.
+- If the release-readiness endpoint is not available in an environment yet, use
+  the build result, `vp check`, tests, and `/api/health` as the temporary gate.
 - Treat it as a release gate: if it returns a non-2xx status or reports a failed
   required check, pause the release and fix the blocker.
 - Keep this endpoint safe to call repeatedly. It should report readiness, not
@@ -38,7 +40,8 @@ Short checklist before release:
 - Build completed from the intended commit.
 - `vp check` and tests passed in CI or locally.
 - `/api/health` returns healthy in the target environment.
-- `/api/release-readiness` returns ready for required dependencies and config.
+- `/api/release-readiness` returns ready for required dependencies and config, or
+  the temporary gate above is documented for that environment.
 - Rollback target is known and accessible.
 - Owner is watching deploy logs and user-facing error rates for at least 15
   minutes after release.
