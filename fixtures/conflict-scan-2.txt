@@ -1,4 +1,4 @@
 alpha
-beta
+beta-B
 gamma
 delta
