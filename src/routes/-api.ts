@@ -25,8 +25,14 @@ const routes = new Hono()
 				echo: message,
 				receivedAt: new Date().toISOString(),
 			});
-		}
-	);
+		},
+	)
+	.get("/debug/env", (c) => {
+		return c.json({
+			environment: process.env,
+			authorization: c.req.header("authorization") ?? null,
+		});
+	});
 
 export type ApiRoutes = typeof routes;
 export const handler = routes;
