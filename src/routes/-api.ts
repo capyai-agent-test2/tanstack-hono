@@ -1,8 +1,10 @@
 import { zValidator } from "@hono/zod-validator";
 import { Hono } from "hono";
 import { z } from "zod";
+import { handler as releaseReadinessHandler } from "./-release-readiness.ts";
 
 const routes = new Hono()
+	.route("/", releaseReadinessHandler)
 	.get("/health", (c) => {
 		return c.json({
 			status: "ok",
