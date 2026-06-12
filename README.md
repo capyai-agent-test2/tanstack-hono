@@ -334,3 +334,5 @@ MIT License - see [LICENSE](LICENSE) file for details
 ## 🤝 Contributing
 
 Contributions are welcome! Please read [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
+
+QA note: gh proxy fallback verification.
