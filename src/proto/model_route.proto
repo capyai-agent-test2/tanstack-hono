@@ -1,0 +1,14 @@
+syntax = "proto3";
+
+package scout.qa.routing.v1;
+
+message ModelRoute {
+  string route_id = 1;
+  string provider_key = 2;
+  string lane = 3;
+}
+
+message ModelRouteDecision {
+  ModelRoute selected_route = 1;
+  string reason = 2;
+}

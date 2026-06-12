@@ -1,0 +1,5 @@
+{
+	"reviewScope": "incremental",
+	"includeOriginalPrContext": true,
+	"changedFilesLimit": 20
+}
