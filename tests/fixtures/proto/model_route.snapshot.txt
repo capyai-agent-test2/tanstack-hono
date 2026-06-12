@@ -1,5 +1,5 @@
 message ModelRoute {
-  string route_id = 1;
-  string provider_key = 2;
-  string lane = 3;
+  string route_id = 11;
+  string provider_key = 20;
+  string lane = 30;
 }

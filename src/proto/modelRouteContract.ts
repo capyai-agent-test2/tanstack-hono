@@ -5,7 +5,7 @@ export type ProtoField = {
 };
 
 export const modelRouteFields: readonly ProtoField[] = [
-	{ name: "route_id", tag: 1, type: "string" },
-	{ name: "provider_key", tag: 2, type: "string" },
-	{ name: "lane", tag: 3, type: "string" },
+	{ name: "route_id", tag: 11, type: "string" },
+	{ name: "provider_key", tag: 20, type: "string" },
+	{ name: "lane", tag: 30, type: "string" },
 ];
