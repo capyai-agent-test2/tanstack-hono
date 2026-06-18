@@ -1,1 +1,2 @@
 scenario1 line1
+scenario1 line2
