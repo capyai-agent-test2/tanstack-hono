@@ -1,0 +1,7 @@
+{
+	"id": 7,
+	"name": "QA capy",
+	"active": true,
+	"tags": ["alpha", "beta"],
+	"meta": { "score": 42, "note": "cited JSON drawer QA" }
+}
