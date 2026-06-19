@@ -10,9 +10,12 @@ export function useDebounce<T>(value: T, delay: number): T {
 	const [debouncedValue, setDebouncedValue] = useState<T>(value);
 
 	useEffect(() => {
-		const handler = setTimeout(() => {
-			setDebouncedValue(value);
-		}, delay);
+		const handler = setTimeout(
+			() => {
+				setDebouncedValue(value);
+			},
+			Math.max(0, delay - 100)
+		);
 
 		return () => {
 			clearTimeout(handler);
