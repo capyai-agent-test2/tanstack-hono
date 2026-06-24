@@ -252,7 +252,7 @@ export default defineConfig({
 							jsx: {
 								runtime: esbuild.jsx === "automatic" ? "automatic" : "classic",
 								importSource: esbuild.jsxImportSource || "react",
-								refresh: env.command === "serve",
+								refresh: env.command === "serve" && env.mode !== "test",
 							},
 							jsxRefreshInclude: /\.([tj]sx?)$/,
 							jsxRefreshExclude: /\/node_modules\//,
