@@ -12,7 +12,7 @@ const routes = new Hono()
 		});
 	})
 	.post(
-		"/echo",
+		"/echo-v2",
 		zValidator(
 			"json",
 			z.object({
