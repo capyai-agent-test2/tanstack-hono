@@ -3,7 +3,7 @@ syntax = "proto3";
 package scout.qa.routing.v1;
 
 message ModelRoute {
-  string route_id = 11;
+  string route_id = 12;
   string provider_key = 20;
   string lane = 30;
 }
