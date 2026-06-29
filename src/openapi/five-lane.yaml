@@ -3,7 +3,7 @@ info:
   title: Same-PR five lane fixture
   version: 1.0.0
 paths:
-  /same-pr/v3/items:
+  /same-pr/v4/items:
     get:
       operationId: listSamePrItems
       responses:
