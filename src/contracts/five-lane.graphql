@@ -1,6 +1,6 @@
 type SamePrProfile {
   samePrId: ID!
-  displayName: String!
+  fullName: String!
 }
 
 type SamePrQuery {
