@@ -1,0 +1,5 @@
+{
+	"defaultLane": "stable",
+	"enablePreviewLane": true,
+	"maxRouteFanout": 3
+}
