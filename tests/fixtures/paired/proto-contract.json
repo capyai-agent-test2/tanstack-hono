@@ -1,4 +1,4 @@
 {
 	"contract": "proto",
-	"field": "same_pr_id"
+	"field": "same_pr_key"
 }

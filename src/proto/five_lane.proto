@@ -3,7 +3,7 @@ syntax = "proto3";
 package five_lane.v1;
 
 message SamePrAccount {
-  string same_pr_id = 11;
+  string same_pr_id = 12;
   string display_name = 2;
 }
 
