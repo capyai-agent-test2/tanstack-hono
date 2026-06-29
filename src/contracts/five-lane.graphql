@@ -1,0 +1,8 @@
+type SamePrProfile {
+  samePrId: ID!
+  displayName: String!
+}
+
+type SamePrQuery {
+  profile(id: ID!): SamePrProfile
+}
