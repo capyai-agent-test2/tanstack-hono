@@ -3,16 +3,16 @@ import { Hono } from "hono";
 import { z } from "zod";
 
 const routes = new Hono()
-	.get("/ready", (c) => {
+	.get("/live", (c) => {
 		return c.json({
-			state: "ok",
-			timestamp: new Date().toISOString(),
+			phase: "ok",
+			checkedAt: new Date().toISOString(),
 			uptime: process.uptime(),
 			environment: process.env.NODE_ENV || "development",
 		});
 	})
 	.post(
-		"/echo-v2",
+		"/echo-v3",
 		zValidator(
 			"json",
 			z.object({
