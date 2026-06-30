@@ -1,8 +1,8 @@
 type SamePrProfile {
   samePrId: ID!
-  legalName: String!
+  displayLegalName: String!
 }
 
 type Query {
-  profileV1(id: ID!): SamePrProfile
+  profileV2(id: ID!): SamePrProfile
 }

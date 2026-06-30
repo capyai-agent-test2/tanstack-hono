@@ -3,6 +3,6 @@ syntax = "proto3";
 package paired_review.v1;
 
 message PairedReview {
-  string same_pr_id = 1;
+  string same_pr_id = 5;
   string label = 2;
 }
