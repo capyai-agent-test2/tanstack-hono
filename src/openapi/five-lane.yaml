@@ -3,9 +3,9 @@ info:
   title: Same-PR five lane fixture
   version: 1.0.0
 paths:
-  /same-pr/v5/items:
+  /same-pr/v6/items:
     get:
-      operationId: listSamePrItems
+      operationId: listSamePrItemsV6
       responses:
         "200":
           description: Items introduced by this PR
