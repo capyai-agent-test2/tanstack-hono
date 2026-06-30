@@ -1,0 +1,8 @@
+type SamePrProfile {
+  samePrId: ID!
+  legalName: String!
+}
+
+type Query {
+  profileV1(id: ID!): SamePrProfile
+}
