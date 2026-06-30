@@ -4,5 +4,5 @@ type SamePrProfile {
 }
 
 type SamePrQuery {
-  profileV7(id: ID!): SamePrProfile
+  profileV8(id: ID!): SamePrProfile
 }
