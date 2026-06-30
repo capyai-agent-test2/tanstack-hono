@@ -3,9 +3,9 @@ info:
   title: Range context fixture
   version: 1.0.0
 paths:
-  /same-pr/v3/items:
+  /same-pr/v4/items:
     get:
-      operationId: listSamePrItemsV3
+      operationId: listSamePrItemsV4
       responses:
         "200":
           description: Items introduced by this PR

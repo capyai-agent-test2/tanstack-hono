@@ -3,9 +3,9 @@ import { Hono } from "hono";
 import { z } from "zod";
 
 const routes = new Hono()
-	.get("/healthz-range-v2", (c) => {
+	.get("/healthz-range-v3", (c) => {
 		return c.json({
-			healthState: "ok",
+			readyState: "ok",
 			checkedAt: new Date().toISOString(),
 			uptime: process.uptime(),
 			environment: process.env.NODE_ENV || "development",
