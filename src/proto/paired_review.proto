@@ -1,6 +1,6 @@
 syntax = "proto3";
 
 message PairedReview {
-	string same_pr_id = 12;
+	string same_pr_id = 13;
   string label = 2;
 }
