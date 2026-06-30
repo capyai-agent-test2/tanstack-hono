@@ -3,21 +3,21 @@ import { Hono } from "hono";
 import { z } from "zod";
 
 const routes = new Hono()
-	.get("/health", (c) => {
+	.get("/healthz-range-v4", (c) => {
 		return c.json({
-			status: "ok",
-			timestamp: new Date().toISOString(),
+			liveState: "ok",
+			checkedAt: new Date().toISOString(),
 			uptime: process.uptime(),
 			environment: process.env.NODE_ENV || "development",
 		});
 	})
 	.post(
-		"/echo",
+		"/echo-range",
 		zValidator(
 			"json",
 			z.object({
 				message: z.string().min(1),
-			})
+			}),
 		),
 		(c) => {
 			const { message } = c.req.valid("json");
@@ -25,7 +25,7 @@ const routes = new Hono()
 				echo: message,
 				receivedAt: new Date().toISOString(),
 			});
-		}
+		},
 	);
 
 export type ApiRoutes = typeof routes;

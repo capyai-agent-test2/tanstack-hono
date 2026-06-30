@@ -1,0 +1,8 @@
+type SamePrProfile {
+  samePrId: ID!
+  displayPreferredName: String!
+}
+
+type Query {
+  profileV5(id: ID!): SamePrProfile
+}

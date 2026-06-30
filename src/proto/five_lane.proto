@@ -1,0 +1,13 @@
+syntax = "proto3";
+
+package range_context.v1;
+
+message RangeContextAccount {
+  string same_pr_id = 9;
+  string display_name = 2;
+}
+
+message RangeContextEnvelope {
+  RangeContextAccount account = 1;
+  string request_id = 10;
+}
