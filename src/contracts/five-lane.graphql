@@ -1,0 +1,8 @@
+type SamePrProfile {
+  samePrId: ID!
+  displayLegalName: String!
+}
+
+type SamePrQuery {
+  profileV9(id: ID!): SamePrProfile
+}

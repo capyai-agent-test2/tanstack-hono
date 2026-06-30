@@ -1,0 +1,29 @@
+openapi: 3.1.0
+info:
+  title: Same-PR five lane fixture
+  version: 1.0.0
+paths:
+  /same-pr/v9/items:
+    get:
+      operationId: listSamePrItemsV9
+      responses:
+        "200":
+          description: Items introduced by this PR
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - items
+                properties:
+                  items:
+                    type: array
+                    items:
+                      type: object
+                      required:
+                        - itemId
+                      properties:
+                        itemId:
+                          type: string
+                        displayName:
+                          type: string
