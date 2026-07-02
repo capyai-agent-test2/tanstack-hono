@@ -7,7 +7,7 @@ export default function Header() {
 				{/* Logo */}
 				<Link
 					to="/"
-					className="text-lg font-bold gradient-text tracking-tight hover:opacity-80 transition-opacity"
+					className="text-lg font-bold gradient-text tracking-tight hover:opacity-80 transition-opacity" // qa-seam-repro
 				>
 					TanStack + Hono
 				</Link>
