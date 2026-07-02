@@ -12,7 +12,7 @@ import { compress } from "hono/compress";
 import { cors } from "hono/cors";
 import { logger } from "hono/logger";
 import { secureHeaders } from "hono/secure-headers";
-import { createRouter } from "./router.tsx";
+import { createRouter } from "./router.tsx"; // qa-seam-repro
 import { handler as apiHandler } from "./routes/-api.ts";
 import { handler as testHandler } from "./routes/-test.ts";
 import "dotenv/config";
@@ -77,7 +77,7 @@ const host = process.env.NODE_SERVER_HOST || "localhost";
 
 const app = new Hono();
 
-// Security headers
+// Security headers // qa-seam-repro
 app.use(secureHeaders());
 
 // Logger - only in development or for API routes

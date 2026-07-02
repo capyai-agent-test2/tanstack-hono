@@ -9,7 +9,7 @@ interface HeroLink {
 interface HeroSectionProps {
 	title: string;
 	description: React.ReactNode;
-	links: HeroLink[];
+	links: HeroLink[]; // qa-seam-repro
 }
 
 export default function HeroSection({ title, description, links }: HeroSectionProps) {
