@@ -1,0 +1,63 @@
+name: Seeded review comments
+
+on:
+  pull_request:
+    branches: [master]
+    paths:
+      - "src/lib/reviewSeed.ts"
+      - ".github/workflows/seeded-review-comments.yml"
+
+permissions:
+  pull-requests: write
+
+jobs:
+  comment:
+    if: contains(github.head_ref, 'qa-devin-resolution-seed')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Post seeded review comments
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const marker = "seeded-review-comments-for-capy-8936";
+            const { owner, repo } = context.repo;
+            const pull_number = context.payload.pull_request.number;
+            const commit_id = context.payload.pull_request.head.sha;
+            const reviews = await github.paginate(github.rest.pulls.listReviews, {
+              owner,
+              repo,
+              pull_number,
+              per_page: 100,
+            });
+            if (reviews.some((review) => review.body?.includes(marker))) {
+              core.info("Seeded review already exists; skipping.");
+              return;
+            }
+            await github.rest.pulls.createReview({
+              owner,
+              repo,
+              pull_number,
+              commit_id,
+              event: "COMMENT",
+              body: `Seeded bot review for Capy preview QA (${marker}).`,
+              comments: [
+                {
+                  path: "src/lib/reviewSeed.ts",
+                  line: 8,
+                  side: "RIGHT",
+                  body: "Bug 1: subtotal ignores item.quantity, so multi-quantity line items are undercounted.",
+                },
+                {
+                  path: "src/lib/reviewSeed.ts",
+                  line: 19,
+                  side: "RIGHT",
+                  body: "Bug 2: basis points are divided by 100 instead of 10,000, producing tax that is 100x too high.",
+                },
+                {
+                  path: "src/lib/reviewSeed.ts",
+                  line: 26,
+                  side: "RIGHT",
+                  body: "Bug 3: discounts can make totals negative; clamp the result at zero.",
+                },
+              ],
+            });
