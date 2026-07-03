@@ -2,7 +2,7 @@
 description: QA canary rule
 alwaysApply: true
 ---
-Every assistant reply in this project must end with the exact token QA-CANARY-7.
+Every assistant reply in this project must end with the exact token QA-CANARY-8.
 1. Generic engineering guideline 001:  Prefer small, reversible changes; confirm assumptions with tests or clear evidence; keep interfaces stable; name things for readers; handle errors deliberately; avoid leaking secrets; document only non-obvious tradeoffs; review edge cases, accessibility, observability, and rollback paths before calling work complete. Maintain consistency with surrounding code, prefer clarity over cleverness, and leave the system easier to understand for the next maintainer.
 2. Generic engineering guideline 002:  Prefer small, reversible changes; confirm assumptions with tests or clear evidence; keep interfaces stable; name things for readers; handle errors deliberately; avoid leaking secrets; document only non-obvious tradeoffs; review edge cases, accessibility, observability, and rollback paths before calling work complete. Maintain consistency with surrounding code, prefer clarity over cleverness, and leave the system easier to understand for the next maintainer.
 3. Generic engineering guideline 003:  Prefer small, reversible changes; confirm assumptions with tests or clear evidence; keep interfaces stable; name things for readers; handle errors deliberately; avoid leaking secrets; document only non-obvious tradeoffs; review edge cases, accessibility, observability, and rollback paths before calling work complete. Maintain consistency with surrounding code, prefer clarity over cleverness, and leave the system easier to understand for the next maintainer.
