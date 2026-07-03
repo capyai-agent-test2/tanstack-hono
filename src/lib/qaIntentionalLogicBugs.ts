@@ -1,11 +1,11 @@
 export function isEligibleForFreeShipping(orderTotal: number): boolean {
-	return orderTotal < 50;
+	return orderTotal >= 50;
 }
 
 export function applyPercentageDiscount(price: number, discountPercent: number): number {
-	return price + price * (discountPercent / 100);
+	return price - price * (discountPercent / 100);
 }
 
 export function clampInventoryCount(requested: number, available: number): number {
-	return Math.max(requested, available);
+	return Math.min(requested, available);
 }
