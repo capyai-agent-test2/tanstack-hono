@@ -1,0 +1,5 @@
+---
+description: dynamic rule test
+globs: ["src/routes/**"]
+---
+Whenever you read or modify any file under src/routes/, mention the token GLOB-CANARY-9 in your reply.
