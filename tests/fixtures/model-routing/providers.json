@@ -1,0 +1,5 @@
+[
+	{ "key": "openai", "timeoutMs": 15000 },
+	{ "key": "anthropic", "timeoutMs": 20000 },
+	{ "key": "local", "timeoutMs": 5000 }
+]

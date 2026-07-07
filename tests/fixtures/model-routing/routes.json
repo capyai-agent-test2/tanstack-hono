@@ -1,0 +1,4 @@
+[
+	{ "routeId": "route-alpha", "providerKey": "openai", "lane": "stable", "weight": 70 },
+	{ "routeId": "route-beta", "providerKey": "anthropic", "lane": "preview", "weight": 30 }
+]

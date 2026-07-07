@@ -3,7 +3,7 @@ import { Hono } from "hono";
 import { z } from "zod";
 
 const routes = new Hono()
-	.get("/health", (c) => {
+	.get("/status", (c) => {
 		return c.json({
 			status: "ok",
 			timestamp: new Date().toISOString(),
