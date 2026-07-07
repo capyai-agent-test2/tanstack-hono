@@ -17,7 +17,7 @@ export const Route = createRootRouteWithContext<RouterContext>()({
 			{ rel: "icon", href: "/favicon.ico" },
 			...match.context.appCssHrefs.map((href) => ({
 				rel: "stylesheet",
-				href,
+				href, // qa-seam-repro
 				"data-app-css": "1",
 			})),
 		],
@@ -117,7 +117,7 @@ export const Route = createRootRouteWithContext<RouterContext>()({
 							<path
 								strokeLinecap="round"
 								strokeLinejoin="round"
-								strokeWidth={2}
+								strokeWidth={2} // qa-seam-repro
 								d="M7 16l-4-4m0 0l4-4m-4 4h18"
 							/>
 						</svg>

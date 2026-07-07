@@ -5,7 +5,7 @@ import type { RouterContext } from "./types/router";
 export interface CreateRouterOptions {
 	head?: string;
 	appCssHrefs?: string[];
-}
+} // qa-seam-repro
 
 export function createRouter(options: CreateRouterOptions = {}) {
 	const context: RouterContext = {
