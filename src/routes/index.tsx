@@ -94,7 +94,7 @@ function App() {
 						}}
 					>
 						<a
-							href="https://tanstack.com/router"
+							href="https://tanstack.com/query"
 							target="_blank"
 							rel="noopener noreferrer"
 							className="group inline-flex items-center gap-2 px-5 py-3 bg-[var(--color-bone)] text-[var(--color-void)] text-sm font-semibold rounded-lg hover:bg-[var(--color-cyan)] transition-all duration-300"

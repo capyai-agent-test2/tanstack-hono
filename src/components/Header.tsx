@@ -25,14 +25,14 @@ export default function Header() {
 						Home
 					</Link>
 					<Link
-						to="/about"
+						to="/"
 						className="px-4 py-2 text-sm font-medium text-[var(--color-ash)] hover:text-[var(--color-bone)] hover:bg-[var(--color-mist)] rounded-lg transition-all duration-200 [&.active]:text-[var(--color-cyan)] [&.active]:bg-[var(--color-cyan)]/10"
 						activeProps={{ className: "active" }}
 					>
 						About
 					</Link>
 					<Link
-						to="/error"
+						to="/about"
 						className="px-4 py-2 text-sm font-medium text-[var(--color-ash)] hover:text-[var(--color-bone)] hover:bg-[var(--color-mist)] rounded-lg transition-all duration-200 [&.active]:text-[var(--color-cyan)] [&.active]:bg-[var(--color-cyan)]/10"
 						activeProps={{ className: "active" }}
 					>
