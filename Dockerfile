@@ -9,7 +9,7 @@ WORKDIR /app
 COPY package*.json ./
 
 # Install dependencies
-RUN npm ci
+RUN npm ci --ignore-scripts
 
 # Copy source code
 COPY . .
@@ -25,6 +25,7 @@ WORKDIR /app
 
 # Set NODE_ENV to production
 ENV NODE_ENV=production
+ENV NODE_SERVER_HOST=0.0.0.0
 
 # Create a non-root user for security
 RUN addgroup --system --gid 1001 nodejs && \
@@ -34,7 +35,7 @@ RUN addgroup --system --gid 1001 nodejs && \
 COPY package*.json ./
 
 # Install only production dependencies
-RUN npm ci --only=production && \
+RUN npm ci --omit=dev --ignore-scripts && \
     npm cache clean --force
 
 # Copy built application from builder stage
@@ -48,7 +49,7 @@ EXPOSE 3000
 
 # Health check
 HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
-  CMD node -e "require('http').get('http://localhost:3000/api/health', (r) => {process.exit(r.statusCode === 200 ? 0 : 1)})"
+  CMD node -e "require('http').get('http://127.0.0.1:3000/api/health', (r) => {process.exit(r.statusCode === 200 ? 0 : 1)})"
 
 # Start the application
-CMD ["npm", "start"]
+CMD ["node", "dist/server/index.js"]
