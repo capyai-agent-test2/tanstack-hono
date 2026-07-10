@@ -73,7 +73,8 @@ function getAppCssHrefs(): string[] {
 const port = process.env.NODE_SERVER_PORT
 	? Number.parseInt(process.env.NODE_SERVER_PORT, 10)
 	: 3000;
-const host = process.env.NODE_SERVER_HOST || "localhost";
+const host =
+	process.env.NODE_SERVER_HOST || (process.env.NODE_ENV === "production" ? "0.0.0.0" : "localhost");
 
 const app = new Hono();
 
