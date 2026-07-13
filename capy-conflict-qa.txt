@@ -1,3 +1,4 @@
 shared-top
 value=preview-head-final-managed
+value=base-final-managed
 shared-bottom
