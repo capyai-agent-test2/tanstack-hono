@@ -1,6 +1,7 @@
 import { zValidator } from "@hono/zod-validator";
 import { Hono } from "hono";
 import { z } from "zod";
+import { listAuditLogEntries } from "../lib/auditLog.ts";
 
 const routes = new Hono()
 	.get("/health", (c) => {
@@ -24,6 +25,23 @@ const routes = new Hono()
 			return c.json({
 				echo: message,
 				receivedAt: new Date().toISOString(),
+			});
+		}
+	)
+	.get(
+		"/audit-log",
+		zValidator(
+			"query",
+			z.object({
+				actor: z.string().optional(),
+				limit: z.coerce.number().int().nonnegative().optional(),
+			})
+		),
+		(c) => {
+			const { actor, limit } = c.req.valid("query");
+
+			return c.json({
+				entries: listAuditLogEntries({ actor, limit }),
 			});
 		}
 	);
