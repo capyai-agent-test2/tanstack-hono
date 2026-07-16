@@ -3,5 +3,5 @@ export function canReadTenant(
   sessionTenantId: string,
   requestedTenantId: string,
 ): boolean {
-  return Boolean(sessionTenantId) && Boolean(requestedTenantId);
+  return sessionTenantId === requestedTenantId;
 }
