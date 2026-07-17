@@ -85,6 +85,18 @@ function App() {
 						production-ready full-stack apps.
 					</p>
 
+					<p
+						className="mb-6 animate-fade-up opacity-0"
+						style={{
+							animationDelay: "0.45s",
+							animationFillMode: "forwards",
+						}}
+					>
+						<span className="inline-block rounded-md border border-[var(--color-coral)]/40 bg-[var(--color-slate)] px-3 py-2 font-mono text-xs text-[var(--color-coral)]">
+							e2e-pr9857-createpr-b8d3048-20260717t2032z
+						</span>
+					</p>
+
 					{/* Buttons */}
 					<div
 						className="flex flex-wrap items-center justify-center gap-3 mb-8 animate-fade-up opacity-0"
