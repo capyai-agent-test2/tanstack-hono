@@ -43,7 +43,8 @@ export function listAuditLog(options: ListAuditLogOptions = {}): AuditLogEntry[]
 
 	return [...filteredEntries]
 		.sort((left, right) => Date.parse(right.timestamp) - Date.parse(left.timestamp))
-		.slice(0, cappedLimit);
+		.slice(0, cappedLimit)
+		.map((entry) => ({ ...entry }));
 }
 
 export function clearAuditLog(): void {
