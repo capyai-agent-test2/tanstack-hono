@@ -496,7 +496,18 @@ export class TemporalCapacityReader {
     };
   }
 
-  async read(services: ManagedTemporalService[]) {
+  async read(
+    services: ManagedTemporalService[],
+    options?: {
+      // Retirement keep-out exemption (retirement-v2 §4.3, I8): builds with
+      // an OPEN, unexpired burial marker — keyed `${deploymentName}#${buildId}`
+      // — are exempt from the active-build-without-services fail-loud check.
+      // Mid-burial partial service deletion (or a break-glass rollback racing
+      // one) must degrade that build with a logged signal, never kill the
+      // env-wide read.
+      keepOutBuilds?: ReadonlySet<string>;
+    },
+  ) {
     const environmentReads = await Promise.allSettled(
       this.config.clusters.map((cluster) =>
         this.readEnvironment({
@@ -573,6 +584,20 @@ export class TemporalCapacityReader {
         !fixedLegacyBuilds.has(deploymentBuild) &&
         !unclassifiedBuilds.has(deploymentBuild)
       ) {
+        if (options?.keepOutBuilds?.has(deploymentBuild)) {
+          // Marker-exempt (retirement-v2 §4.3): the retire verb owns this
+          // build; services vanishing mid-burial is the expected T5/T6 shape
+          // and a rollback racing it is the caller's conflict metric, not an
+          // env-wide crash.
+          console.warn(
+            JSON.stringify({
+              event: "capacity.temporal.retiring_build_without_services",
+              build: deploymentBuild,
+              state,
+            }),
+          );
+          continue;
+        }
         throw new Error(
           `Temporal ${state} role-pure build ${deploymentBuild} has no capacity-managed ECS services`,
         );

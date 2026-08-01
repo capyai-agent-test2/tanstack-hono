@@ -1,5 +1,8 @@
 import type { TemporalStablePoolId } from "@capy/shared/temporal/capacity";
-import type { TemporalDrainRecord } from "@capy/shared/temporal/capacity";
+import type {
+  RetirementAbortReason,
+  TemporalDrainRecord,
+} from "@capy/shared/temporal/capacity";
 import type { TemporalTaskQueue } from "@capy/shared/temporal/task-queues";
 
 export type CapacityEnvironment = "prod" | "dev" | "staging" | "preview";
@@ -153,11 +156,26 @@ export type WriterAuthority = {
   checksum: string;
 };
 
+// Ledger v2 Phase A grant (retirement-v2 §3, ruled 2026-07-18): a TTL'd
+// charge with a cause — written by the plan transaction only where granted >
+// observed desired, deleted when ECS delivers (observed >= granted), the
+// service disappears, the grant expires, or a retirement release clears it.
+export type CapacityGrant = {
+  vcpu: number;
+  expiresAt: number;
+};
+
 export type CapacityLedger = {
   generation: number;
   managedCommittedVcpu: number;
   activeReservationVcpu: number;
   allocations: Record<string, number>;
+  // Phase A dual-book: written alongside `allocations` in the same
+  // generation-fenced transaction, same item. Admission still reads
+  // `allocations` (the flip is Phase B, explicitly not this wave); the
+  // AllocationDriftVcpu/GrantPendingVcpu metrics measure the phantom mass
+  // the flip will reclaim. Optional: items written before Phase A lack it.
+  grants?: Record<string, CapacityGrant>;
   inventoryHash: string;
   updatedAt: number;
 };
@@ -343,6 +361,44 @@ export type RedeployManagedServiceInput = {
   reservationOwnerToken: string;
 };
 
+// ─── Retirement v2 marker ops (design doc 2026-07-18 §2.5/§4.2) ───
+// Controller-owned data-plane writes invoked synchronously by the iac
+// `retire` verb through the reserve/release invoke-retry protocol. The verb
+// keeps the burial sequencing; these ops are the dumb fenced transactions
+// (Q1 ruling: one codebase, one deployable, one IAM principal writes the
+// admission table). Idempotent by intentId — a byte-identical resend of any
+// op converges to the same marker/ledger state.
+
+export type RetirementBeginInput = {
+  operation: "retirement-begin";
+  buildId: string;
+  intentId: string;
+  environment: CapacityEnvironment;
+  deploymentName: string;
+  services: Array<{ serviceArn: string; priorDesired: number }>;
+  expiresAt: number;
+};
+
+export type RetirementReleaseInput = {
+  operation: "retirement-release";
+  buildId: string;
+  intentId: string;
+  serviceArn: string;
+};
+
+export type RetirementAbortInput = {
+  operation: "retirement-abort";
+  buildId: string;
+  intentId: string;
+  reason: RetirementAbortReason;
+};
+
+export type RetirementCloseInput = {
+  operation: "retirement-close";
+  buildId: string;
+  intentId: string;
+};
+
 export type ControllerInput =
   | ReconcileInput
   | EnsureChainInput
@@ -351,7 +407,11 @@ export type ControllerInput =
   | UpdateManagedServiceInput
   | RedeployManagedServiceInput
   | CheckLoadGateInput
-  | RotateChainInput;
+  | RotateChainInput
+  | RetirementBeginInput
+  | RetirementReleaseInput
+  | RetirementAbortInput
+  | RetirementCloseInput;
 
 export type ReconcileOutput = {
   operation: "reconcile";

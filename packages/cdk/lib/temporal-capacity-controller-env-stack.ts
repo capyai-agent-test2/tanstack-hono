@@ -612,6 +612,79 @@ export class TemporalCapacityControllerEnvStack extends cdk.Stack {
         treatMissingData: cloudwatch.TreatMissingData.NOT_BREACHING,
       }),
     );
+    // ─── Retirement v2 marker observability (design doc 2026-07-18 §4.3) ───
+    // All three emit every cycle (zero included), so NOT_BREACHING gaps are
+    // safe and any breach is a real datapoint.
+    // A marked build observed live: break-glass rollback raced a burial and
+    // the keep-out was overridden — any single occurrence pages (the operator
+    // rule is "dispatch retirement-abort first").
+    alarms.push(
+      new cloudwatch.Alarm(this, "RetirementMarkerLiveConflict", {
+        alarmName: `capy-temporal-capacity-retirement-marker-live-conflict-${envName}`,
+        alarmDescription:
+          "A build with an OPEN retirement keep-out marker was observed " +
+          "CURRENT/RAMPING/DRAINING: a rollback raced a burial. The " +
+          "controller has overridden the keep-out; dispatch " +
+          "retirement-abort for the build or expect conflict churn until " +
+          "the marker lapses.",
+        metric: new cloudwatch.Metric({
+          namespace: "Capy/TemporalCapacity",
+          metricName: "RetirementMarkerLiveConflict",
+          dimensionsMap: controllerDimensions,
+          period: cdk.Duration.minutes(1),
+          statistic: "Sum",
+        }),
+        threshold: 1,
+        evaluationPeriods: 1,
+        treatMissingData: cloudwatch.TreatMissingData.NOT_BREACHING,
+      }),
+    );
+    // OPEN marker age > 2 cron periods (2 x 30 min) = the burial owner is
+    // wedged (replaces R1's DrainedAwaitingRetirement wedged-reaper signal).
+    // Sustained across 3 x 5-minute periods to ride out a single slow pass.
+    alarms.push(
+      new cloudwatch.Alarm(this, "RetirementMarkerAge", {
+        alarmName: `capy-temporal-capacity-retirement-marker-age-${envName}`,
+        alarmDescription:
+          "An OPEN retirement keep-out marker is older than two cleanup " +
+          "cron periods: the retire verb is not converging on the burial " +
+          "(wedged T4 quiesce or T6 version deletion). A wedged T6 is the " +
+          "600-version namespace-cap leak recreated.",
+        metric: new cloudwatch.Metric({
+          namespace: "Capy/TemporalCapacity",
+          metricName: "OpenRetirementMarkerAgeSeconds",
+          dimensionsMap: controllerDimensions,
+          period: cdk.Duration.minutes(5),
+          statistic: "Maximum",
+        }),
+        threshold: 3600,
+        evaluationPeriods: 3,
+        treatMissingData: cloudwatch.TreatMissingData.NOT_BREACHING,
+      }),
+    );
+    // Sustained expired markers: verb runs keep dying mid-burial (crash
+    // class), or a deferred build's marker is never resumed. One lapse is
+    // the designed crash-recovery path; sustained lapses page.
+    alarms.push(
+      new cloudwatch.Alarm(this, "ExpiredRetirementMarkers", {
+        alarmName: `capy-temporal-capacity-expired-retirement-markers-${envName}`,
+        alarmDescription:
+          "OPEN retirement markers are sitting past their expiry for a " +
+          "sustained window: retire verb runs are dying mid-burial (or " +
+          "never re-beginning). The controller has resumed ownership of " +
+          "those builds; check the cleanup.yml legs.",
+        metric: new cloudwatch.Metric({
+          namespace: "Capy/TemporalCapacity",
+          metricName: "ExpiredRetirementMarkers",
+          dimensionsMap: controllerDimensions,
+          period: cdk.Duration.minutes(5),
+          statistic: "Maximum",
+        }),
+        threshold: 1,
+        evaluationPeriods: 6,
+        treatMissingData: cloudwatch.TreatMissingData.NOT_BREACHING,
+      }),
+    );
     // EnvironmentBudgetUtilization lands once per cycle, and dev/staging
     // cycles can run longer than a minute; the period must be wide enough
     // that every bucket holds a datapoint, or NOT_BREACHING gaps would reset

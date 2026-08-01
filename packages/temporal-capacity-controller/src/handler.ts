@@ -40,5 +40,19 @@ export async function handler(event: ControllerInput) {
   if (event.operation === "redeploy-managed-service") {
     return controller.redeployManagedService(event);
   }
+  // Retirement v2 marker ops (design doc 2026-07-18 §2.5): the iac retire
+  // verb sequences the burial; these are its fenced data-plane writes.
+  if (event.operation === "retirement-begin") {
+    return controller.beginRetirement(event);
+  }
+  if (event.operation === "retirement-release") {
+    return controller.releaseRetirement(event);
+  }
+  if (event.operation === "retirement-abort") {
+    return controller.abortRetirement(event);
+  }
+  if (event.operation === "retirement-close") {
+    return controller.closeRetirement(event);
+  }
   return controller.updateManagedService(event);
 }
