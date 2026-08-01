@@ -767,33 +767,6 @@ export class AwsCapacityReader {
     return response.$metadata.requestId;
   }
 
-  // Batch-retirement zeroing for a DRAINED build's service: unlike protected
-  // scale-in this writes desiredCount=0 in one shot, revalidated by an O(1)
-  // point DescribeServices against the cycle's expected desired count (the
-  // same pattern decreaseDesiredCount uses — never an account re-scan).
-  async zeroDesiredCount(service: ManagedTemporalService) {
-    const current = await this.ecs.send(
-      new DescribeServicesCommand({
-        cluster: service.clusterArn,
-        services: [service.serviceArn],
-      }),
-    );
-    const liveDesired = current.services?.[0]?.desiredCount;
-    if (liveDesired !== service.desiredCount) {
-      throw new Error(
-        `Retirement desired count changed before write: expected ${service.desiredCount}, observed ${liveDesired ?? "missing"}`,
-      );
-    }
-    const response = await this.ecs.send(
-      new UpdateServiceCommand({
-        cluster: service.clusterArn,
-        service: service.serviceArn,
-        desiredCount: 0,
-      }),
-    );
-    return response.$metadata.requestId;
-  }
-
   async updateManagedService(params: {
     clusterArn: string;
     serviceArn: string;
@@ -954,8 +927,12 @@ export class AwsCapacityReader {
     pendingTasks: number;
     desiredNotReadyReplicas: number;
     drainDeadlineExpired: number;
-    drainedAwaitingRetirement: number;
-    retirementVerifyTimeouts: number;
+    openRetirementMarkerAgeSeconds: number;
+    expiredRetirementMarkers: number;
+    retirementMarkerLiveConflicts: number;
+    allocationDriftVcpu: number;
+    grantPendingVcpu: number;
+    grantsExpired: number;
   }) {
     const metricData: MetricDatum[] = [
       {
@@ -1038,22 +1015,52 @@ export class AwsCapacityReader {
         Unit: "Count",
         StorageResolution: 1,
       },
-      // Builds fully zeroed by the retirement lane but whose ECS services the
-      // iac retire verb has not yet deleted. Emitted every cycle (zero
-      // included) so a wedged reaper is visible as a sustained nonzero count.
+      // Retirement v2 marker observability (design doc 2026-07-18 §4.3),
+      // replacing R1's DrainedAwaitingRetirement/RetirementVerifyTimeout.
+      // Age of the oldest OPEN unexpired burial marker: sustained > 2 cron
+      // periods (~60 min) = wedged reaper. Zero-inclusive so an alarm can
+      // tell a healthy quiet janitor from a dead emitter.
       {
-        MetricName: "DrainedAwaitingRetirement",
-        Value: params.drainedAwaitingRetirement,
+        MetricName: "OpenRetirementMarkerAgeSeconds",
+        Value: params.openRetirementMarkerAgeSeconds,
+        Unit: "Seconds",
+        StorageResolution: 1,
+      },
+      // OPEN markers whose expiresAt passed (verb died mid-burial; the
+      // controller resumed ownership). Sustained nonzero pages.
+      {
+        MetricName: "ExpiredRetirementMarkers",
+        Value: params.expiredRetirementMarkers,
         Unit: "Count",
         StorageResolution: 1,
       },
-      // Retirements that hit their verify deadline (typed FAILED closes,
-      // including zeroed-but-still-running builds, which otherwise appear in
-      // no signal). Zero-inclusive like DrainDeadlineExpired so an alarm can
-      // tell quiet from dead.
+      // A marked build observed live (CURRENT/RAMPING/DRAINING): break-glass
+      // rollback raced a burial; the keep-out was overridden. Alarm >= 1.
       {
-        MetricName: "RetirementVerifyTimeout",
-        Value: params.retirementVerifyTimeouts,
+        MetricName: "RetirementMarkerLiveConflict",
+        Value: params.retirementMarkerLiveConflicts,
+        Unit: "Count",
+        StorageResolution: 1,
+      },
+      // Ledger v2 Phase A (design doc 2026-07-18 §3): phantom charge held by
+      // the allocations ratchet (Σ max(0, charged − observed)) — the mass the
+      // Phase B admission flip will reclaim — and the same charge as the
+      // TTL'd grant book would price it. Their divergence is the flip gate.
+      {
+        MetricName: "AllocationDriftVcpu",
+        Value: params.allocationDriftVcpu,
+        Unit: "Count",
+      },
+      {
+        MetricName: "GrantPendingVcpu",
+        Value: params.grantPendingVcpu,
+        Unit: "Count",
+      },
+      // Grants that expired undelivered this cycle (ECS never delivered the
+      // capacity): the typed signal the ratchet silently absorbed.
+      {
+        MetricName: "GrantExpired",
+        Value: params.grantsExpired,
         Unit: "Count",
         StorageResolution: 1,
       },

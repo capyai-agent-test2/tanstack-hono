@@ -6,19 +6,20 @@ import {
 import { describe, expect, it } from "vitest";
 
 import {
-  TEMPORAL_RETIREMENT_MAX_BUILDS_PER_CYCLE,
   TEMPORAL_SCALE_IN_ELIGIBILITY_SECONDS,
   TEMPORAL_STABLE_POOL_IDS,
   TEMPORAL_STABLE_POOLS,
-  type TemporalRetirementRecord,
+  type RetiringBuildEntry,
   type TemporalStablePoolId,
 } from "@capy/shared/temporal/capacity";
 
 import {
   CapacityController,
+  computeRetirementKeepOut,
   type ControllerDependencies,
 } from "./controller.js";
 import type {
+  CapacityGrant,
   CapacityLedger,
   CapacityReservation,
   ControllerConfig,
@@ -127,9 +128,13 @@ const dependencies = (params: {
   claimDecreaseError?: Error;
   heartbeatError?: Error;
   claimCycleError?: Error;
-  retirements?: TemporalRetirementRecord[];
+  retiringBuilds?: Record<string, RetiringBuildEntry>;
+  ledgerGrants?: Record<string, CapacityGrant>;
+  ledgerAllocations?: Record<string, number>;
   extraServices?: ManagedTemporalService[];
+  beginError?: Error;
   releaseError?: Error;
+  planClaimError?: Error;
 }) => {
   const updates: number[] = [];
   const protections: boolean[] = [];
@@ -137,17 +142,21 @@ const dependencies = (params: {
   const completedScaleIn: Array<ReconcilerState["scaleIn"]> = [];
   const drainIntents: TemporalDrainRecord[] = [];
   const cancelledDrains: Array<{ intentId: string; reason: string }> = [];
-  const retirementIntents: TemporalRetirementRecord[] = [];
-  const retirementReleases: Array<{
+  const markerBegins: Array<{ buildId: string; intentId: string }> = [];
+  const markerReleases: Array<{
+    buildId: string;
     serviceArn: string;
     releasedVcpu: number;
   }> = [];
-  const completedRetirements: Array<{
-    serviceArn: string;
-    terminalState: string;
-    reason?: string;
+  const markerAborts: Array<{ buildId: string; reason: string }> = [];
+  const markerCloses: Array<{ buildId: string }> = [];
+  const capacityPlans: Array<{
+    allocations: Record<string, number>;
+    grants: Record<string, CapacityGrant>;
   }> = [];
-  const zeroedServices: string[] = [];
+  const temporalReadOptions: Array<
+    { keepOutBuilds?: ReadonlySet<string> } | undefined
+  > = [];
   let ledgerGeneration = ledger.generation;
   const maintenanceIds: string[] = [];
   const recoveredDrains: string[] = [];
@@ -155,7 +164,12 @@ const dependencies = (params: {
   const managedServiceUpdates: string[] = [];
   const cycleMetrics: Array<{
     drainDeadlineExpired: number;
-    drainedAwaitingRetirement: number;
+    openRetirementMarkerAgeSeconds: number;
+    expiredRetirementMarkers: number;
+    retirementMarkerLiveConflicts: number;
+    allocationDriftVcpu: number;
+    grantPendingVcpu: number;
+    grantsExpired: number;
   }> = [];
   const cycleResultMetrics: string[] = [];
   const currentService = {
@@ -223,11 +237,17 @@ const dependencies = (params: {
       async readControlSnapshot() {
         return {
           authority: authority(params.writerKind),
-          ledger: { ...ledger, generation: ledgerGeneration },
+          ledger: {
+            ...ledger,
+            generation: ledgerGeneration,
+            allocations: params.ledgerAllocations ?? ledger.allocations,
+            ...(params.ledgerGrants ? { grants: params.ledgerGrants } : {}),
+          },
           reconciler: {
             capability: "PROTECTED_SCALE_IN" as const,
             scaleIn: params.scaleIn,
           },
+          retiringBuilds: { builds: params.retiringBuilds ?? {} },
         };
       },
       async readReservationSnapshot() {
@@ -237,7 +257,12 @@ const dependencies = (params: {
       async claimCycle() {
         if (params.claimCycleError) throw params.claimCycleError;
       },
-      async claimCapacityPlan() {
+      async claimCapacityPlan(input) {
+        if (params.planClaimError) throw params.planClaimError;
+        capacityPlans.push({
+          allocations: input.allocations,
+          grants: input.grants,
+        });
         ledgerGeneration = 2;
         return 2;
       },
@@ -271,35 +296,28 @@ const dependencies = (params: {
       async putDrainIntent(input) {
         drainIntents.push(input.drain);
       },
-      async putRetirementIntent(input) {
-        retirementIntents.push(input.record);
+      async beginRetirement(input) {
+        if (params.beginError) throw params.beginError;
+        markerBegins.push({
+          buildId: input.buildId,
+          intentId: input.entry.intentId,
+        });
       },
-      async listActiveRetirements() {
-        return params.retirements ?? [];
-      },
-      async claimRetirementRelease(input) {
+      async releaseRetirementLedger(input) {
         if (params.releaseError) throw params.releaseError;
-        retirementReleases.push({
-          serviceArn: input.record.serviceArn,
+        markerReleases.push({
+          buildId: input.buildId,
+          serviceArn: input.serviceArn,
           releasedVcpu: input.releasedVcpu,
         });
-        return {
-          ledger: {
-            ...input.ledger,
-            generation: input.ledger.generation + 1,
-            allocations: {
-              ...input.ledger.allocations,
-              [input.record.serviceArn]: 0,
-            },
-          },
-        };
+        ledgerGeneration = input.ledger.generation + 1;
+        return ledgerGeneration;
       },
-      async completeRetirement(input) {
-        completedRetirements.push({
-          serviceArn: input.record.serviceArn,
-          terminalState: input.terminalState,
-          reason: input.reason,
-        });
+      async abortRetirement(input) {
+        markerAborts.push({ buildId: input.buildId, reason: input.reason });
+      },
+      async closeRetirement(input) {
+        markerCloses.push({ buildId: input.buildId });
       },
       async cancelDrain(input) {
         cancelledDrains.push({
@@ -383,10 +401,6 @@ const dependencies = (params: {
         if (params.decreaseError) throw params.decreaseError;
         return "request-id";
       },
-      async zeroDesiredCount(zeroed) {
-        zeroedServices.push(zeroed.serviceArn);
-        return "request-id";
-      },
       async updateTaskProtection(input) {
         protections.push(input.protectionEnabled);
         return {
@@ -408,7 +422,13 @@ const dependencies = (params: {
       async emitCycleMetrics(metrics) {
         cycleMetrics.push({
           drainDeadlineExpired: metrics.drainDeadlineExpired,
-          drainedAwaitingRetirement: metrics.drainedAwaitingRetirement,
+          openRetirementMarkerAgeSeconds:
+            metrics.openRetirementMarkerAgeSeconds,
+          expiredRetirementMarkers: metrics.expiredRetirementMarkers,
+          retirementMarkerLiveConflicts: metrics.retirementMarkerLiveConflicts,
+          allocationDriftVcpu: metrics.allocationDriftVcpu,
+          grantPendingVcpu: metrics.grantPendingVcpu,
+          grantsExpired: metrics.grantsExpired,
         });
       },
       async emitCycleResultMetric(metric) {
@@ -418,7 +438,8 @@ const dependencies = (params: {
       async emitQueueBacklogMetrics() {},
     },
     temporal: {
-      async read() {
+      async read(_services, options) {
+        temporalReadOptions.push(options);
         return {
           observations: effectiveObservations,
           services,
@@ -442,10 +463,12 @@ const dependencies = (params: {
     completedScaleIn,
     drainIntents,
     cancelledDrains,
-    retirementIntents,
-    retirementReleases,
-    completedRetirements,
-    zeroedServices,
+    markerBegins,
+    markerReleases,
+    markerAborts,
+    markerCloses,
+    capacityPlans,
+    temporalReadOptions,
     maintenanceIds,
     maintenanceLaunchAttempts,
     managedServiceUpdates,
@@ -742,7 +765,7 @@ describe("increase-only controller state machine", () => {
       { intentId: "intent-1", reason: "DRAIN_DEADLINE_EXPIRED" },
     ]);
     expect(test.cycleMetrics).toEqual([
-      { drainDeadlineExpired: 1, drainedAwaitingRetirement: 0 },
+      expect.objectContaining({ drainDeadlineExpired: 1 }),
     ]);
   });
 
@@ -926,11 +949,11 @@ describe("increase-only controller state machine", () => {
     ).rejects.toThrow("ResourceNotFound: drains table");
   });
 
-  it("cancels a legacy drained-service intent and leaves its service to the retirement lane", async () => {
-    // Transition safety: pre-lane SCALE_IN drains for DRAINED services are no
-    // longer eligible (the retirement lane owns DRAINED), so the live lane
-    // cancels them as state-changed; the retirement lane skips their service
-    // this cycle (active legacy drain) and adopts it once the cancel lands.
+  it("cancels a legacy drained-service intent and leaves the build to the retire verb", async () => {
+    // Transition safety: pre-existing SCALE_IN drains for DRAINED services
+    // are no longer eligible (retirement-v2: the iac retire verb owns
+    // DRAINED builds end-to-end), so the live lane cancels them as
+    // state-changed and performs NO retirement work of its own.
     const now = Date.now();
     const waitingDrain: TemporalDrainRecord = {
       kind: "SCALE_IN",
@@ -967,14 +990,11 @@ describe("increase-only controller state machine", () => {
         reason: "DEMAND_OR_SERVICE_STATE_CHANGED",
       },
     ]);
-    // The whole build is DRAINED: every sibling service is retired this
-    // cycle; the drain-blocked parent waits for the next one.
-    const retiredArns = test.retirementIntents.map(
-      (record) => record.serviceArn,
-    );
-    expect(retiredArns).not.toContain("arn:service/parent");
-    expect(retiredArns).toHaveLength(TEMPORAL_STABLE_POOL_IDS.length - 1);
-    expect(test.zeroedServices).toEqual(retiredArns);
+    // The whole build is DRAINED: the controller performs no retirement of
+    // its own — no marker writes, no zero writes — the retire verb owns the
+    // burial (retirement-v2 §2).
+    expect(test.markerBegins).toHaveLength(0);
+    expect(test.markerReleases).toHaveLength(0);
     expect(test.drainIntents).toHaveLength(0);
     expect(test.updates).toEqual([]);
   });
@@ -1033,7 +1053,7 @@ describe("increase-only controller state machine", () => {
     await new CapacityController(config, test.value).reconcile(input);
 
     expect(test.drainIntents).toHaveLength(0);
-    expect(test.retirementIntents).toHaveLength(0);
+    expect(test.markerBegins).toHaveLength(0);
     expect(test.updates).toEqual([]);
   });
 
@@ -1529,453 +1549,558 @@ describe("increase-only controller state machine", () => {
   });
 });
 
-describe("drained-build batch retirement lane", () => {
-  const drainedService = (
-    index: number,
+describe("retirement v2 keep-out (design doc 2026-07-18 §4)", () => {
+  const NOW_SLACK_MS = 5 * 60_000;
+
+  const marker = (
+    buildId: string,
+    overrides?: Partial<RetiringBuildEntry>,
+  ): Record<string, RetiringBuildEntry> => ({
+    [buildId]: {
+      intentId: `run-${buildId}`,
+      deploymentName: "capy-temporal-worker-prod",
+      environment: "prod",
+      services: { [`arn:service/${buildId}-vm`]: { priorDesired: 2 } },
+      state: "OPEN",
+      createdAt: Date.now() - 60_000,
+      expiresAt: Date.now() + 45 * 60_000,
+      ...overrides,
+    },
+  });
+
+  const retiringService = (
+    buildId: string,
     overrides?: Partial<ManagedTemporalService>,
   ): ManagedTemporalService => ({
-    ...service(2),
-    buildState: "DRAINED",
-    buildId: `build-drained-${index}`,
+    ...service(0),
+    buildState: "REGISTRATION",
+    buildId,
     // vm rather than parent: the harness synthesizes a nonzero jam-run
-    // backlog for parent-pool services, which would read as scale-out demand
-    // and route the cycle away from the scale-in lanes entirely.
+    // backlog for parent-pool services, which would read as scale-out
+    // demand unrelated to the keep-out under test.
     poolId: "vm",
-    serviceArn: `arn:service/drained-${index}`,
-    serviceName: `drained-${index}`,
-    runningCount: 2,
+    serviceArn: `arn:service/${buildId}-vm`,
+    serviceName: `${buildId}-vm`,
+    desiredCount: 0,
+    runningCount: 0,
     ...overrides,
   });
 
-  const retirementRecord = (
-    target: ManagedTemporalService,
-    overrides?: Partial<TemporalRetirementRecord>,
-  ): TemporalRetirementRecord => ({
-    kind: "RETIREMENT",
-    serviceArn: target.serviceArn,
-    clusterArn: target.clusterArn,
-    poolId: target.poolId,
-    buildId: target.buildId,
-    intentId: `retire-${target.serviceName}`,
-    cycleId: "prior-cycle",
-    authorityGeneration: 1,
-    ledgerGeneration: 1,
-    priorDesiredCount: 2,
-    state: "ZEROING",
-    createdAt: Date.now() - 60_000,
-    verifyDeadline: Date.now() + 5 * 60_000,
-    ...overrides,
-  });
-
-  it("zeroes every service of a DRAINED build in one cycle, stripping but never requiring protection", async () => {
-    // The F2 failure mode this lane kills: the old per-task pipeline REQUIRED
-    // live task protection, so one protection-lapsed DRAINED service blocked
-    // scale-in for the whole environment. Here one task is protected (gets
-    // stripped) and every other task has no protection at all — the batch
-    // still zeroes the entire build in a single cycle.
+  it("classifies markers exhaustively: open, expired, and terminal", () => {
     const now = Date.now();
+    const keepOut = computeRetirementKeepOut(
+      {
+        "build-open": marker("build-open")["build-open"]!,
+        "build-expired": marker("build-expired", {
+          expiresAt: now - 1_000,
+        })["build-expired"]!,
+        "build-buried": marker("build-buried", { state: "BURIED" })[
+          "build-buried"
+        ]!,
+        "build-aborted": marker("build-aborted", {
+          state: "ABORTED",
+          terminalReason: "TEMPORAL_NOT_DRAINED",
+        })["build-aborted"]!,
+      },
+      now,
+    );
+    expect([...keepOut.openBuilds.keys()]).toEqual([
+      "capy-temporal-worker-prod#build-open",
+    ]);
+    expect(keepOut.expiredMarkers).toBe(1);
+    expect(keepOut.oldestOpenMarkerAgeSeconds).toBeGreaterThanOrEqual(59);
+  });
+
+  it("excludes a marked build from allocation: no cycle write ever targets a marked service", async () => {
+    // The build's REGISTRATION service sits at desired 0 with floor 1 — the
+    // exact shape the allocator would scale up. The OPEN marker keeps the
+    // controller out entirely (I2): no desired-count write, no drain intent.
+    const test = dependencies({
+      writerKind: "STEP_FUNCTIONS_LAMBDA",
+      desiredCount: 4,
+      extraServices: [retiringService("build-retiring")],
+      retiringBuilds: marker("build-retiring"),
+    });
+
+    await new CapacityController(config, test.value).reconcile(input);
+
+    expect(test.updates).toEqual([]);
+    expect(test.drainIntents).toHaveLength(0);
+    expect(test.results).toEqual(["NOOP"]);
+    // The keep-out set rode into the Temporal read (throw exemption, I8).
+    expect([...(test.temporalReadOptions[0]?.keepOutBuilds ?? [])]).toEqual([
+      "capy-temporal-worker-prod#build-retiring",
+    ]);
+  });
+
+  it("never re-staffs a DRAINED build from the ratcheted allocation book, even after a marker lapse", async () => {
+    // The gate-confirmed lapse-window hole (observed empirically 2026-07-18:
+    // the allocator re-staffed zeroed drained builds). A DRAINED service at
+    // desired 0 with a stale `allocations` entry and an EXPIRED marker must
+    // not be granted back to its committed floor — the allocator's
+    // committedDesired clamp is the DRAINED analog of scaleInEligible's
+    // hard-false.
+    const drained = retiringService("build-lapsed", {
+      buildState: "DRAINED",
+      desiredCount: 0,
+      runningCount: 0,
+    });
+    const test = dependencies({
+      writerKind: "STEP_FUNCTIONS_LAMBDA",
+      desiredCount: 4,
+      extraServices: [drained],
+      ledgerAllocations: { [drained.serviceArn]: 8 },
+      retiringBuilds: marker("build-lapsed", {
+        expiresAt: Date.now() - 1_000,
+      }),
+    });
+
+    await new CapacityController(config, test.value).reconcile(input);
+
+    expect(test.updates).toEqual([]);
+    expect(test.results).toEqual(["NOOP"]);
+  });
+
+  it("resolves a plan-claim generation race as PARTIAL instead of a Lambda error", async () => {
+    // desiredCount 1 forces a scale-out plan; the claim loses its generation
+    // fence to an out-of-cycle admission write. The cycle must complete
+    // PARTIAL (retry next cycle), not crash the invoke (adversarial-gate
+    // fix, 2026-07-18).
     const test = dependencies({
       writerKind: "STEP_FUNCTIONS_LAMBDA",
       desiredCount: 1,
-      serviceOverride: { buildState: "DRAINED" },
-      tasks: [
-        {
-          taskArn: "arn:aws:ecs:us-west-2:123456789012:task/cluster/parent-1",
-          clusterArn: "cluster",
-          serviceArn: "arn:service/parent",
-          serviceName: "parent",
-          poolId: "parent",
-          buildId: "build-1",
-          lastStatus: "RUNNING",
-          desiredStatus: "RUNNING",
-          healthStatus: "HEALTHY",
-          protectionEnabled: true,
-          protectionExpirationDate: now + 10 * 60_000,
-        },
-        {
-          taskArn: "arn:aws:ecs:us-west-2:123456789012:task/cluster/vm-1",
-          clusterArn: "cluster",
-          serviceArn: "arn:service/vm",
-          serviceName: "vm",
-          poolId: "vm",
-          buildId: "build-1",
-          lastStatus: "RUNNING",
-          desiredStatus: "RUNNING",
-          healthStatus: "HEALTHY",
-          protectionEnabled: false,
-        },
-      ],
-    });
-
-    await new CapacityController(config, test.value).reconcile(input);
-
-    expect(test.retirementIntents).toHaveLength(
-      TEMPORAL_STABLE_POOL_IDS.length,
-    );
-    expect(test.retirementIntents[0]).toMatchObject({
-      kind: "RETIREMENT",
-      state: "ZEROING",
-    });
-    expect(test.zeroedServices).toHaveLength(TEMPORAL_STABLE_POOL_IDS.length);
-    expect(test.retirementReleases).toHaveLength(
-      TEMPORAL_STABLE_POOL_IDS.length,
-    );
-    // parent: priorDesired 1 x 2 vCPU per task.
-    expect(
-      test.retirementReleases.find(
-        (release) => release.serviceArn === "arn:service/parent",
-      ),
-    ).toEqual({ serviceArn: "arn:service/parent", releasedVcpu: 2 });
-    // Only the protected task is stripped; the unprotected one is untouched
-    // and blocks nothing.
-    expect(test.protections).toEqual([false]);
-    // No per-task drain machinery and no live-lane decrements are involved.
-    expect(test.drainIntents).toHaveLength(0);
-    expect(test.updates).toEqual([]);
-    expect(test.results).toEqual(["APPLIED"]);
-  });
-
-  it("refuses a batch over the sanity floor instead of zeroing it", async () => {
-    const extras = Array.from(
-      { length: TEMPORAL_RETIREMENT_MAX_BUILDS_PER_CYCLE + 1 },
-      (_, index) => drainedService(index),
-    );
-    const test = dependencies({
-      writerKind: "STEP_FUNCTIONS_LAMBDA",
-      desiredCount: 4,
-      extraServices: extras,
-    });
-
-    await new CapacityController(config, test.value).reconcile(input);
-
-    expect(test.retirementIntents).toHaveLength(0);
-    expect(test.zeroedServices).toHaveLength(0);
-    expect(test.retirementReleases).toHaveLength(0);
-    expect(test.results).toEqual(["PARTIAL"]);
-  });
-
-  it("confirms a zeroed retirement and releases an allocation the crashed cycle never released", async () => {
-    const target = drainedService(0, {
-      desiredCount: 0,
-      runningCount: 0,
-      pendingCount: 0,
-    });
-    const record = retirementRecord(target);
-    const test = dependencies({
-      writerKind: "STEP_FUNCTIONS_LAMBDA",
-      desiredCount: 4,
-      extraServices: [target],
-      retirements: [record],
-    });
-
-    await new CapacityController(config, test.value).reconcile(input);
-
-    // releasedLedgerGeneration is absent on the record, so the allocation
-    // release is still owed (priorDesired 2 x 2 vCPU) before the record
-    // closes APPLIED.
-    expect(test.retirementReleases).toEqual([
-      { serviceArn: target.serviceArn, releasedVcpu: 4 },
-    ]);
-    expect(test.completedRetirements).toEqual([
-      {
-        serviceArn: target.serviceArn,
-        terminalState: "APPLIED",
-        reason: undefined,
-      },
-    ]);
-    expect(test.retirementIntents).toHaveLength(0);
-    expect(test.zeroedServices).toHaveLength(0);
-    expect(test.results).toEqual(["APPLIED"]);
-    // The build is fully zeroed but its services still exist: it counts as
-    // awaiting the retire verb.
-    expect(test.cycleMetrics).toEqual([
-      { drainDeadlineExpired: 0, drainedAwaitingRetirement: 1 },
-    ]);
-  });
-
-  it("does not repeat the ledger release when the record already carries it", async () => {
-    const target = drainedService(0, {
-      desiredCount: 0,
-      runningCount: 0,
-      pendingCount: 0,
-    });
-    const record = retirementRecord(target, { releasedLedgerGeneration: 2 });
-    const test = dependencies({
-      writerKind: "STEP_FUNCTIONS_LAMBDA",
-      desiredCount: 4,
-      extraServices: [target],
-      retirements: [record],
-    });
-
-    await new CapacityController(config, test.value).reconcile(input);
-
-    expect(test.retirementReleases).toHaveLength(0);
-    expect(test.completedRetirements).toEqual([
-      {
-        serviceArn: target.serviceArn,
-        terminalState: "APPLIED",
-        reason: undefined,
-      },
-    ]);
-  });
-
-  it("resumes the zero write for a record whose actuation never landed", async () => {
-    const target = drainedService(0);
-    const record = retirementRecord(target);
-    const test = dependencies({
-      writerKind: "STEP_FUNCTIONS_LAMBDA",
-      desiredCount: 4,
-      extraServices: [target],
-      retirements: [record],
-    });
-
-    await new CapacityController(config, test.value).reconcile(input);
-
-    // Resumed, not re-intended: the ZEROING record already exists.
-    expect(test.retirementIntents).toHaveLength(0);
-    expect(test.zeroedServices).toEqual([target.serviceArn]);
-    expect(test.retirementReleases).toEqual([
-      { serviceArn: target.serviceArn, releasedVcpu: 4 },
-    ]);
-    expect(test.completedRetirements).toHaveLength(0);
-    expect(test.results).toEqual(["APPLIED"]);
-  });
-
-  it("fails a retirement that misses its verify deadline with a typed reason", async () => {
-    const target = drainedService(0, { desiredCount: 0, runningCount: 2 });
-    const record = retirementRecord(target, {
-      verifyDeadline: Date.now() - 1_000,
-      releasedLedgerGeneration: 2,
-    });
-    const test = dependencies({
-      writerKind: "STEP_FUNCTIONS_LAMBDA",
-      desiredCount: 4,
-      extraServices: [target],
-      retirements: [record],
-    });
-
-    await new CapacityController(config, test.value).reconcile(input);
-
-    expect(test.completedRetirements).toEqual([
-      {
-        serviceArn: target.serviceArn,
-        terminalState: "FAILED",
-        reason: "RETIREMENT_RUNNING_NOT_STOPPED",
-      },
-    ]);
-    expect(test.zeroedServices).toHaveLength(0);
-    expect(test.results).toEqual(["PARTIAL"]);
-  });
-
-  it("closes a retirement whose service the retire verb already deleted, releasing an owed allocation from pool config", async () => {
-    const record = retirementRecord(drainedService(9));
-    const test = dependencies({
-      writerKind: "STEP_FUNCTIONS_LAMBDA",
-      desiredCount: 4,
-      retirements: [record],
-    });
-
-    await new CapacityController(config, test.value).reconcile(input);
-
-    // No releasedLedgerGeneration on the record and no live service to read
-    // a task shape from: the owed release is priced from the vm pool config.
-    expect(test.retirementReleases).toEqual([
-      {
-        serviceArn: record.serviceArn,
-        releasedVcpu: 2 * (TEMPORAL_STABLE_POOLS.vm.cpu / 1024),
-      },
-    ]);
-    expect(test.completedRetirements).toEqual([
-      {
-        serviceArn: record.serviceArn,
-        terminalState: "APPLIED",
-        reason: "SERVICE_DELETED",
-      },
-    ]);
-    expect(test.results).toEqual(["APPLIED"]);
-  });
-
-  it("releases the owed allocation before failing a zeroed-but-still-running retirement at the deadline", async () => {
-    // The confirmed leak: zero landed, release deferred (contention/crash),
-    // protection re-renewal keeps tasks running past the deadline. FAILED is
-    // terminal and desired=0 never re-selects, so failing without the
-    // release would strand the allocation as a phantom floor forever.
-    const target = drainedService(0, { desiredCount: 0, runningCount: 2 });
-    const record = retirementRecord(target, {
-      verifyDeadline: Date.now() - 1_000,
-    });
-    const test = dependencies({
-      writerKind: "STEP_FUNCTIONS_LAMBDA",
-      desiredCount: 4,
-      extraServices: [target],
-      retirements: [record],
-    });
-
-    await new CapacityController(config, test.value).reconcile(input);
-
-    expect(test.retirementReleases).toEqual([
-      { serviceArn: target.serviceArn, releasedVcpu: 4 },
-    ]);
-    expect(test.completedRetirements).toEqual([
-      {
-        serviceArn: target.serviceArn,
-        terminalState: "FAILED",
-        reason: "RETIREMENT_RUNNING_NOT_STOPPED",
-      },
-    ]);
-    expect(test.results).toEqual(["PARTIAL"]);
-  });
-
-  it("does not release at the deadline when the zero was never applied", async () => {
-    // desired > 0 means the allocation still prices a real running service,
-    // and the candidate filter will mint a fresh intent next cycle.
-    const target = drainedService(0);
-    const record = retirementRecord(target, {
-      verifyDeadline: Date.now() - 1_000,
-    });
-    const test = dependencies({
-      writerKind: "STEP_FUNCTIONS_LAMBDA",
-      desiredCount: 4,
-      extraServices: [target],
-      retirements: [record],
-    });
-
-    await new CapacityController(config, test.value).reconcile(input);
-
-    expect(test.retirementReleases).toHaveLength(0);
-    expect(test.completedRetirements).toEqual([
-      {
-        serviceArn: target.serviceArn,
-        terminalState: "FAILED",
-        reason: "RETIREMENT_ZERO_NEVER_APPLIED",
-      },
-    ]);
-  });
-
-  it("aborts an in-flight retirement when the build rolled back to a live state", async () => {
-    // Break-glass SetCurrent rollback while the retirement was ZEROING: the
-    // lane must not yo-yo zero writes against the rollback. The service
-    // rides the main (pool-complete) build so the rollback registers as an
-    // active build without tripping the missing-pool invariant.
-    const target = drainedService(0, {
-      buildState: "CURRENT",
-      buildId: "build-1",
-    });
-    const record = retirementRecord(target);
-    const test = dependencies({
-      writerKind: "STEP_FUNCTIONS_LAMBDA",
-      desiredCount: 4,
-      extraServices: [target],
-      retirements: [record],
-    });
-
-    await new CapacityController(config, test.value).reconcile(input);
-
-    expect(test.completedRetirements).toEqual([
-      {
-        serviceArn: target.serviceArn,
-        terminalState: "FAILED",
-        reason: "BUILD_STATE_CHANGED",
-      },
-    ]);
-    expect(test.zeroedServices).toHaveLength(0);
-    // A live service's allocation belongs to the scale-out plan write.
-    expect(test.retirementReleases).toHaveLength(0);
-    expect(test.results).toEqual(["PARTIAL"]);
-  });
-
-  it("proceeds with a resumed zero when the build merely deregistered", async () => {
-    // DRAINED -> REGISTRATION (version deleted) is not a rollback: the build
-    // can never route work again, so the zero is still the right move.
-    const target = drainedService(0, { buildState: "REGISTRATION" });
-    const record = retirementRecord(target);
-    const test = dependencies({
-      writerKind: "STEP_FUNCTIONS_LAMBDA",
-      desiredCount: 4,
-      extraServices: [target],
-      retirements: [record],
-    });
-
-    await new CapacityController(config, test.value).reconcile(input);
-
-    expect(test.completedRetirements).toHaveLength(0);
-    expect(test.zeroedServices).toEqual([target.serviceArn]);
-    expect(test.retirementReleases).toEqual([
-      { serviceArn: target.serviceArn, releasedVcpu: 4 },
-    ]);
-  });
-
-  it("defers a service whose ledger release hits contention without aborting the batch", async () => {
-    const target = drainedService(0);
-    const test = dependencies({
-      writerKind: "STEP_FUNCTIONS_LAMBDA",
-      desiredCount: 4,
-      extraServices: [target],
-      releaseError: new TransactionCanceledException({
+      planClaimError: new TransactionCanceledException({
         $metadata: {},
         message: "ConditionalCheckFailed",
         CancellationReasons: [
           { Code: "None" },
           { Code: "ConditionalCheckFailed" },
-          { Code: "None" },
-          { Code: "None" },
         ],
       }),
     });
 
     await new CapacityController(config, test.value).reconcile(input);
 
-    // The intent and the ECS zero landed; only the release deferred. The
-    // record stays ZEROING and the next cycle's confirm path resumes the
-    // owed release (covered above).
-    expect(test.retirementIntents).toHaveLength(1);
-    expect(test.zeroedServices).toEqual([target.serviceArn]);
-    expect(test.retirementReleases).toHaveLength(0);
-    expect(test.completedRetirements).toHaveLength(0);
+    expect(test.updates).toEqual([]);
     expect(test.results).toEqual(["PARTIAL"]);
   });
 
-  it("defers a confirm whose owed release hits contention instead of closing without it", async () => {
-    const target = drainedService(0, {
-      desiredCount: 0,
-      runningCount: 0,
-      pendingCount: 0,
-    });
-    const record = retirementRecord(target);
+  it("resumes ownership of a build whose marker expired (lapse, not stickiness)", async () => {
+    // A crashed verb must not freeze a build forever (the F1 class): past
+    // expiresAt the controller scales the floor back up and the lapse is
+    // visible as ExpiredRetirementMarkers.
     const test = dependencies({
       writerKind: "STEP_FUNCTIONS_LAMBDA",
       desiredCount: 4,
-      extraServices: [target],
-      retirements: [record],
-      releaseError: new TransactionCanceledException({
-        $metadata: {},
-        message: "ConditionalCheckFailed",
-        CancellationReasons: [{ Code: "ConditionalCheckFailed" }],
+      extraServices: [retiringService("build-lapsed")],
+      retiringBuilds: marker("build-lapsed", {
+        expiresAt: Date.now() - 1_000,
       }),
     });
 
     await new CapacityController(config, test.value).reconcile(input);
 
-    // The record must NOT close APPLIED while the release is still owed.
-    expect(test.completedRetirements).toHaveLength(0);
-    expect(test.results).toEqual(["PARTIAL"]);
+    expect(test.updates).toEqual([1]);
+    expect(test.results).toEqual(["APPLIED"]);
+    expect(test.cycleMetrics[0]?.expiredRetirementMarkers).toBe(1);
+    expect(test.cycleMetrics[0]?.openRetirementMarkerAgeSeconds).toBe(0);
   });
 
-  it("creates no retirement intents from a stale Temporal read", async () => {
-    // A stale read cannot assert DRAINED; new intents wait for a complete
-    // read while in-flight verification continues on ECS-side facts alone.
+  it("prunes a marked service's scaleIn entry", async () => {
+    const target = retiringService("build-retiring");
     const test = dependencies({
       writerKind: "STEP_FUNCTIONS_LAMBDA",
       desiredCount: 4,
-      staleReadCount: 1,
-      extraServices: [drainedService(0)],
+      extraServices: [target],
+      retiringBuilds: marker("build-retiring"),
+      scaleIn: {
+        [target.serviceArn]: { lastScaleInAt: 123 },
+        "arn:service/parent": { lastScaleInAt: 456 },
+      },
     });
 
     await new CapacityController(config, test.value).reconcile(input);
 
-    expect(test.retirementIntents).toHaveLength(0);
-    expect(test.zeroedServices).toHaveLength(0);
+    expect(test.completedScaleIn[0]).not.toHaveProperty(target.serviceArn);
+    expect(test.completedScaleIn[0]).toHaveProperty("arn:service/parent");
+  });
+
+  it("keeps the env cycle alive when a marked build is active with missing pool services", async () => {
+    // Rollback-during-burial, the F10+F4 composite: the build regressed to
+    // CURRENT while its services are half-deleted. Without the marker this
+    // kills every cycle env-wide; with it the cycle completes, the keep-out
+    // is overridden for the live build, and the conflict metric fires.
+    const rolledBack = retiringService("build-rollback", {
+      buildState: "CURRENT",
+      desiredCount: 2,
+      runningCount: 2,
+    });
+    const withMarker = dependencies({
+      writerKind: "STEP_FUNCTIONS_LAMBDA",
+      desiredCount: 4,
+      extraServices: [rolledBack],
+      retiringBuilds: marker("build-rollback"),
+    });
+    await new CapacityController(config, withMarker.value).reconcile(input);
+    expect(withMarker.results).toEqual(["NOOP"]);
+    expect(withMarker.cycleMetrics[0]?.retirementMarkerLiveConflicts).toBe(1);
+
+    // Control: the same world without a marker still fails loud — the
+    // exemption is scoped to marked builds, not a blanket softening.
+    const withoutMarker = dependencies({
+      writerKind: "STEP_FUNCTIONS_LAMBDA",
+      desiredCount: 4,
+      extraServices: [rolledBack],
+    });
+    await expect(
+      new CapacityController(config, withoutMarker.value).reconcile(input),
+    ).rejects.toThrow(/missing pool services/);
+  });
+
+  it("defers a maintenance record targeting a marked service", async () => {
+    const target = retiringService("build-retiring", {
+      buildState: "REGISTRATION",
+      desiredCount: 1,
+      runningCount: 1,
+    });
+    const test = dependencies({
+      writerKind: "STEP_FUNCTIONS_LAMBDA",
+      desiredCount: 4,
+      extraServices: [target],
+      retiringBuilds: marker("build-retiring"),
+      maintenance: {
+        maintenanceId: "maintenance-1",
+        clusterArn: "cluster",
+        serviceArn: target.serviceArn,
+        buildId: target.buildId,
+        poolId: "vm",
+        oldTaskArns: [],
+        desiredCount: 1,
+        state: "REQUESTED",
+        createdAt: Date.now(),
+        deadline: Date.now() + NOW_SLACK_MS,
+        reservationId: "reservation-1",
+        reservationOwnerToken: "token-1",
+      },
+    });
+
+    await new CapacityController(config, test.value).reconcile(input);
+
+    expect(test.maintenanceLaunchAttempts).toHaveLength(0);
+    expect(test.managedServiceUpdates).toHaveLength(0);
     expect(test.results).toEqual(["PARTIAL"]);
+  });
+});
+
+describe("ledger v2 phase A dual-book (design doc 2026-07-18 §3)", () => {
+  it("measures allocation drift and grant charge from the same inventory read", async () => {
+    // parent observed 4 vCPU (desired 4 x cpuUnits 1024 in the harness? no:
+    // parent cpuUnits 2048 -> desired 4 x 2 = 8 vCPU) against a ratcheted
+    // allocation of 100 -> drift 92. The vm grant (6 vCPU vs 4 observed)
+    // carries 2 pending; the expired parent grant counts as GrantExpired.
+    const now = Date.now();
+    const test = dependencies({
+      writerKind: "STEP_FUNCTIONS_LAMBDA",
+      desiredCount: 4,
+      ledgerAllocations: { "arn:service/parent": 100 },
+      ledgerGrants: {
+        "arn:service/parent": { vcpu: 100, expiresAt: now - 1_000 },
+        "arn:service/vm": { vcpu: 6, expiresAt: now + 60_000 },
+      },
+    });
+
+    await new CapacityController(config, test.value).reconcile(input);
+
+    expect(test.cycleMetrics[0]?.allocationDriftVcpu).toBe(92);
+    expect(test.cycleMetrics[0]?.grantsExpired).toBe(1);
+    expect(test.cycleMetrics[0]?.grantPendingVcpu).toBe(2);
+  });
+
+  it("writes a TTL'd grant alongside the allocation for every scale-up the plan grants", async () => {
+    // desiredCount 1 -> parent floor increase to 2 (the classic APPLIED
+    // path): the plan write must now carry the Phase A grant book with a
+    // grant for the parent scale-up, in the same transaction as allocations.
+    const test = dependencies({
+      writerKind: "STEP_FUNCTIONS_LAMBDA",
+      desiredCount: 1,
+    });
+
+    await new CapacityController(config, test.value).reconcile(input);
+
+    expect(test.updates).toEqual([2]);
+    expect(test.capacityPlans).toHaveLength(1);
+    const plan = test.capacityPlans[0]!;
+    const parentGrant = plan.grants["arn:service/parent"];
+    expect(parentGrant?.vcpu).toBe(
+      2 * (TEMPORAL_STABLE_POOLS.parent.cpu / 1024),
+    );
+    expect(parentGrant?.expiresAt).toBeGreaterThan(Date.now());
+    // Admission behavior is untouched (Phase A only): allocations are still
+    // written exactly as before, grants ride along.
+    expect(plan.allocations["arn:service/parent"]).toBe(
+      2 * (TEMPORAL_STABLE_POOLS.parent.cpu / 1024),
+    );
+  });
+
+  it("carries an unexpired undelivered grant forward without refreshing its TTL", async () => {
+    const now = Date.now();
+    const originalExpiry = now + 2 * 60_000;
+    const test = dependencies({
+      writerKind: "STEP_FUNCTIONS_LAMBDA",
+      desiredCount: 1,
+      // parent will re-grant 2 (>= observed desired 1); the prior grant at
+      // the same vcpu must keep its original expiry — refreshing on every
+      // cycle would recreate the ratchet with extra steps.
+      ledgerGrants: {
+        "arn:service/parent": { vcpu: 4, expiresAt: originalExpiry },
+      },
+    });
+
+    await new CapacityController(config, test.value).reconcile(input);
+
+    const plan = test.capacityPlans[0]!;
+    expect(plan.grants["arn:service/parent"]?.expiresAt).toBe(originalExpiry);
+  });
+});
+
+describe("retirement v2 marker ops (handler surface)", () => {
+  const poolArn =
+    "arn:aws:ecs:us-west-2:123456789012:service/cluster/capy-temporal-worker-prod-vm-service-aaaaaaaaaaaa";
+
+  const openEntry = (overrides?: Partial<RetiringBuildEntry>) =>
+    ({
+      intentId: "run-alive",
+      deploymentName: "capy-temporal-worker-prod",
+      environment: "prod",
+      services: { [poolArn]: { priorDesired: 3 } },
+      state: "OPEN",
+      createdAt: Date.now() - 60_000,
+      expiresAt: Date.now() + 45 * 60_000,
+      ...overrides,
+    }) satisfies RetiringBuildEntry;
+
+  it("refuses begin with a typed MARKER_HELD when a foreign live marker owns the build", async () => {
+    const test = dependencies({
+      writerKind: "STEP_FUNCTIONS_LAMBDA",
+      desiredCount: 1,
+      retiringBuilds: { "build-1": openEntry() },
+    });
+    const controller = new CapacityController(config, test.value);
+
+    const outcome = await controller.beginRetirement({
+      operation: "retirement-begin",
+      buildId: "build-1",
+      intentId: "run-other",
+      environment: "prod",
+      deploymentName: "capy-temporal-worker-prod",
+      services: [{ serviceArn: poolArn, priorDesired: 3 }],
+      expiresAt: Date.now() + 45 * 60_000,
+    });
+
+    expect(outcome).toEqual({ begun: false, reason: "MARKER_HELD" });
+    expect(test.markerBegins).toHaveLength(0);
+  });
+
+  it("re-begins over an expired marker, carrying the dead run's release stamps forward", async () => {
+    // Crash matrix (I6): begin admits an expired OPEN entry, and the T3
+    // idempotency stamps must survive the ownership change so a resumed
+    // release never double-decrements the ledger.
+    const test = dependencies({
+      writerKind: "STEP_FUNCTIONS_LAMBDA",
+      desiredCount: 1,
+      retiringBuilds: {
+        "build-1": openEntry({
+          intentId: "run-dead",
+          expiresAt: Date.now() - 1_000,
+          services: {
+            [poolArn]: { priorDesired: 3, releasedLedgerGeneration: 7 },
+          },
+        }),
+      },
+    });
+    const controller = new CapacityController(config, test.value);
+
+    const outcome = await controller.beginRetirement({
+      operation: "retirement-begin",
+      buildId: "build-1",
+      intentId: "run-new",
+      environment: "prod",
+      deploymentName: "capy-temporal-worker-prod",
+      services: [{ serviceArn: poolArn, priorDesired: 3 }],
+      expiresAt: Date.now() + 45 * 60_000,
+    });
+
+    expect(outcome).toEqual({ begun: true });
+    expect(test.markerBegins).toEqual([
+      { buildId: "build-1", intentId: "run-new" },
+    ]);
+    // The stamp survives: the fake records only ids, so assert through the
+    // release path — an already-stamped service reports alreadyReleased.
+    const release = await controller.releaseRetirement({
+      operation: "retirement-release",
+      buildId: "build-1",
+      intentId: "run-dead",
+      serviceArn: poolArn,
+    });
+    expect(release).toMatchObject({ alreadyReleased: true });
+  });
+
+  it("prices a release from the pool config derived from the service name", async () => {
+    const test = dependencies({
+      writerKind: "STEP_FUNCTIONS_LAMBDA",
+      desiredCount: 1,
+      retiringBuilds: { "build-1": openEntry() },
+    });
+    const controller = new CapacityController(config, test.value);
+
+    const outcome = await controller.releaseRetirement({
+      operation: "retirement-release",
+      buildId: "build-1",
+      intentId: "run-alive",
+      serviceArn: poolArn,
+    });
+
+    expect(outcome).toMatchObject({ released: true });
+    // vm pool: 2048 cpu units -> 2 vCPU x priorDesired 3.
+    expect(test.markerReleases).toEqual([
+      { buildId: "build-1", serviceArn: poolArn, releasedVcpu: 6 },
+    ]);
+  });
+
+  it("reports an already-stamped release instead of re-running the ledger transaction", async () => {
+    const test = dependencies({
+      writerKind: "STEP_FUNCTIONS_LAMBDA",
+      desiredCount: 1,
+      retiringBuilds: {
+        "build-1": openEntry({
+          services: {
+            [poolArn]: { priorDesired: 3, releasedLedgerGeneration: 9 },
+          },
+        }),
+      },
+    });
+    const controller = new CapacityController(config, test.value);
+
+    const outcome = await controller.releaseRetirement({
+      operation: "retirement-release",
+      buildId: "build-1",
+      intentId: "run-alive",
+      serviceArn: poolArn,
+    });
+
+    expect(outcome).toEqual({
+      released: false,
+      alreadyReleased: true,
+      ledgerGeneration: 9,
+    });
+    expect(test.markerReleases).toHaveLength(0);
+  });
+
+  it("treats abort and close as idempotent under resend", async () => {
+    const aborted = dependencies({
+      writerKind: "STEP_FUNCTIONS_LAMBDA",
+      desiredCount: 1,
+      retiringBuilds: {
+        "build-1": openEntry({
+          state: "ABORTED",
+          terminalReason: "TEMPORAL_NOT_DRAINED",
+        }),
+      },
+    });
+    const abortedController = new CapacityController(config, aborted.value);
+    await expect(
+      abortedController.abortRetirement({
+        operation: "retirement-abort",
+        buildId: "build-1",
+        intentId: "run-alive",
+        reason: "TEMPORAL_NOT_DRAINED",
+      }),
+    ).resolves.toMatchObject({ aborted: true });
+    expect(aborted.markerAborts).toHaveLength(0);
+
+    const buried = dependencies({
+      writerKind: "STEP_FUNCTIONS_LAMBDA",
+      desiredCount: 1,
+      retiringBuilds: { "build-1": openEntry({ state: "BURIED" }) },
+    });
+    const buriedController = new CapacityController(config, buried.value);
+    await expect(
+      buriedController.closeRetirement({
+        operation: "retirement-close",
+        buildId: "build-1",
+        intentId: "run-alive",
+      }),
+    ).resolves.toEqual({ closed: true });
+    expect(buried.markerCloses).toHaveLength(0);
+    // A pruned (absent) entry also resolves as done.
+    await expect(
+      buriedController.closeRetirement({
+        operation: "retirement-close",
+        buildId: "build-gone",
+        intentId: "run-alive",
+      }),
+    ).resolves.toEqual({ closed: true });
+  });
+
+  it("rejects cross-terminal transitions: abort after close and close after abort", async () => {
+    const buried = dependencies({
+      writerKind: "STEP_FUNCTIONS_LAMBDA",
+      desiredCount: 1,
+      retiringBuilds: { "build-1": openEntry({ state: "BURIED" }) },
+    });
+    await expect(
+      new CapacityController(config, buried.value).abortRetirement({
+        operation: "retirement-abort",
+        buildId: "build-1",
+        intentId: "run-alive",
+        reason: "OPERATOR_REQUESTED",
+      }),
+    ).rejects.toThrow(/protocol error/);
+
+    const aborted = dependencies({
+      writerKind: "STEP_FUNCTIONS_LAMBDA",
+      desiredCount: 1,
+      retiringBuilds: {
+        "build-1": openEntry({
+          state: "ABORTED",
+          terminalReason: "TEMPORAL_NOT_DRAINED",
+        }),
+      },
+    });
+    await expect(
+      new CapacityController(config, aborted.value).closeRetirement({
+        operation: "retirement-close",
+        buildId: "build-1",
+        intentId: "run-alive",
+      }),
+    ).rejects.toThrow(/protocol error/);
+  });
+
+  it("refuses every marker op before controller writer cutover", async () => {
+    const test = dependencies({
+      writerKind: "APPLICATION_AUTO_SCALING",
+      desiredCount: 1,
+    });
+    const controller = new CapacityController(config, test.value);
+    await expect(
+      controller.beginRetirement({
+        operation: "retirement-begin",
+        buildId: "build-1",
+        intentId: "run-1",
+        environment: "prod",
+        deploymentName: "capy-temporal-worker-prod",
+        services: [],
+        expiresAt: Date.now() + 45 * 60_000,
+      }),
+    ).rejects.toThrow(/writer authority/);
+    await expect(
+      controller.releaseRetirement({
+        operation: "retirement-release",
+        buildId: "build-1",
+        intentId: "run-1",
+        serviceArn: poolArn,
+      }),
+    ).rejects.toThrow(/writer authority/);
   });
 });
 

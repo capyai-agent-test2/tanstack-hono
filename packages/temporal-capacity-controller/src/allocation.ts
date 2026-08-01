@@ -8,8 +8,18 @@ import type {
 } from "./types.js";
 
 const taskVcpu = (demand: PoolDemand) => demand.service.cpuUnits / 1024;
+// The allocator-side analog of scaleInEligible's DRAINED hard-false
+// (retirement-v2 §4.3, adversarial-gate hardening): a DRAINED build must
+// never be re-staffed from the ratcheted allocation book. Temporal already
+// proved no work exists, so the only admissible baseline is the OBSERVED
+// desired count — a lapsed keep-out marker (or a never-marked DRAINED build)
+// with stale `allocations` entries otherwise seeds granted=committedDesired
+// above desired and the actuation loop scales a zeroed build back up (the
+// empirical 2026-07-18 re-staffing incident).
 const committedDesired = (demand: PoolDemand) =>
-  demand.service.committedDesiredCount ?? demand.service.desiredCount;
+  demand.service.buildState === "DRAINED"
+    ? demand.service.desiredCount
+    : (demand.service.committedDesiredCount ?? demand.service.desiredCount);
 
 const priority = (demand: PoolDemand) => {
   const { environment, buildState, poolId } = demand.service;

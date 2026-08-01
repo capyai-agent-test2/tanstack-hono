@@ -335,8 +335,12 @@ const cycleMetricsParams = {
   pendingTasks: 0,
   desiredNotReadyReplicas: 0,
   drainDeadlineExpired: 0,
-  drainedAwaitingRetirement: 0,
-  retirementVerifyTimeouts: 0,
+  openRetirementMarkerAgeSeconds: 0,
+  expiredRetirementMarkers: 0,
+  retirementMarkerLiveConflicts: 0,
+  allocationDriftVcpu: 0,
+  grantPendingVcpu: 0,
+  grantsExpired: 0,
 };
 
 const scopedConfig: ControllerConfig = {
@@ -368,23 +372,57 @@ describe("cycle metric emission", () => {
     ).toMatchObject({ Value: 0 });
   });
 
-  it("emits DrainedAwaitingRetirement every cycle, zero included, so a wedged reaper is visible", async () => {
+  it("emits the retirement marker metrics every cycle, zero included, so a wedged reaper is visible", async () => {
     const { reader, published } = readerWithMetricSink(scopedConfig);
     await reader.emitCycleMetrics(cycleMetricsParams);
-    expect(
-      published.find(
-        (datum) => datum.MetricName === "DrainedAwaitingRetirement",
-      ),
-    ).toMatchObject({ Value: 0 });
+    for (const metricName of [
+      "OpenRetirementMarkerAgeSeconds",
+      "ExpiredRetirementMarkers",
+      "RetirementMarkerLiveConflict",
+      "GrantExpired",
+    ]) {
+      expect(
+        published.find((datum) => datum.MetricName === metricName),
+      ).toMatchObject({ Value: 0 });
+    }
     await reader.emitCycleMetrics({
       ...cycleMetricsParams,
-      drainedAwaitingRetirement: 3,
+      openRetirementMarkerAgeSeconds: 3_600,
+      retirementMarkerLiveConflicts: 1,
     });
     expect(
-      published.filter(
-        (datum) => datum.MetricName === "DrainedAwaitingRetirement",
+      published.find(
+        (datum) =>
+          datum.MetricName === "OpenRetirementMarkerAgeSeconds" &&
+          datum.Value === 3_600,
       ),
-    ).toHaveLength(2);
+    ).toBeDefined();
+    expect(
+      published.find(
+        (datum) =>
+          datum.MetricName === "RetirementMarkerLiveConflict" &&
+          datum.Value === 1,
+      ),
+    ).toBeDefined();
+  });
+
+  it("emits the phase A dual-book metrics", async () => {
+    const { reader, published } = readerWithMetricSink(scopedConfig);
+    await reader.emitCycleMetrics({
+      ...cycleMetricsParams,
+      allocationDriftVcpu: 92,
+      grantPendingVcpu: 2,
+      grantsExpired: 1,
+    });
+    expect(
+      published.find((datum) => datum.MetricName === "AllocationDriftVcpu"),
+    ).toMatchObject({ Value: 92 });
+    expect(
+      published.find((datum) => datum.MetricName === "GrantPendingVcpu"),
+    ).toMatchObject({ Value: 2 });
+    expect(
+      published.find((datum) => datum.MetricName === "GrantExpired"),
+    ).toMatchObject({ Value: 1 });
   });
 
   it("emits EnvironmentBudgetUtilization as the managed share of the environment budget", async () => {

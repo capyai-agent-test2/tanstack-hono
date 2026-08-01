@@ -1,9 +1,8 @@
 import { randomUUID } from "node:crypto";
 
 import {
+  TEMPORAL_CAPACITY_GRANT_TTL_MS,
   TEMPORAL_CAPACITY_MANIFEST_VERSION,
-  TEMPORAL_RETIREMENT_MAX_BUILDS_PER_CYCLE,
-  TEMPORAL_RETIREMENT_VERIFY_TIMEOUT_SECONDS,
   TEMPORAL_SCALE_IN_COOLDOWN_SECONDS,
   TEMPORAL_SCALE_IN_ELIGIBILITY_SECONDS,
   TEMPORAL_SCALE_IN_INTENT_TIMEOUT_SECONDS,
@@ -13,7 +12,8 @@ import {
   TEMPORAL_STABLE_POOL_IDS,
   TEMPORAL_STABLE_POOLS,
   isTemporalPoolOptional,
-  type TemporalRetirementRecord,
+  temporalPoolIdForServiceName,
+  type RetiringBuildEntry,
   type TemporalStablePoolId,
 } from "@capy/shared/temporal/capacity";
 
@@ -31,6 +31,7 @@ import {
 import { TemporalCapacityReader } from "./temporal-capacity.js";
 import type {
   CapacityEnvironment,
+  CapacityGrant,
   CapacityLedger,
   CapacitySnapshot,
   ControllerConfig,
@@ -42,6 +43,10 @@ import type {
   ReconcileInput,
   ReconcileOutput,
   ReconcilerState,
+  RetirementAbortInput,
+  RetirementBeginInput,
+  RetirementCloseInput,
+  RetirementReleaseInput,
   MaintenanceRedeploy,
   TemporalDrainRecord,
   WorkerProcessObservation,
@@ -64,10 +69,10 @@ export type ControllerDependencies = {
     | "isConditionalFailure"
     | "listActiveDrains"
     | "putDrainIntent"
-    | "putRetirementIntent"
-    | "listActiveRetirements"
-    | "claimRetirementRelease"
-    | "completeRetirement"
+    | "beginRetirement"
+    | "releaseRetirementLedger"
+    | "abortRetirement"
+    | "closeRetirement"
     | "cancelDrain"
     | "refreshReadyDrainFence"
     | "claimProtectedDecrease"
@@ -92,7 +97,6 @@ export type ControllerDependencies = {
     | "readForReservation"
     | "updateDesiredCount"
     | "decreaseDesiredCount"
-    | "zeroDesiredCount"
     | "updateTaskProtection"
     | "readTaskTerminalState"
     | "updateManagedService"
@@ -141,9 +145,8 @@ const scaleInEligible = (
   demand: PoolDemand,
   observations: QueueCapacityObservation[],
 ) => {
-  // DRAINED builds are owned by the batch retirement lane
-  // (reconcileDrainedRetirements) and never enter the live protected
-  // scale-in pipeline.
+  // DRAINED builds are owned by the iac retire verb's marker-fenced burial
+  // (retirement-v2 §2) and never enter the live protected scale-in pipeline.
   if (demand.service.buildState === "DRAINED") return false;
   if (
     demand.staleInput ||
@@ -217,6 +220,66 @@ const workerForTask = (
       )
     );
   });
+
+export const retiringBuildKey = (deploymentName: string, buildId: string) =>
+  `${deploymentName}#${buildId}`;
+
+// Retirement keep-out (retirement-v2 §4.3, I2): for every marker entry with
+// state=OPEN ∧ expiresAt >= now, the build's services are not the
+// controller's problem — the retire verb owns them. BURIED/ABORTED are
+// terminal (pruned by the verb's next begin/close); an expired OPEN marker
+// means the verb run died and the controller RESUMES ownership (harmless in
+// every dangerous direction: the build is DRAINED, floor 0, no telemetry
+// synthesis) — stickiness would recreate the F1 crashed-owner freeze.
+// The state switch is exhaustive (I4): a new marker state without a
+// classification here fails compilation.
+export type RetirementKeepOut = {
+  // `${deploymentName}#${buildId}` → marker-listed service ARNs for every
+  // kept-out build (OPEN ∧ unexpired).
+  openBuilds: Map<string, string[]>;
+  // OPEN entries whose expiresAt has passed (lapsed — alarmable signal; the
+  // controller has resumed ownership of those builds).
+  expiredMarkers: number;
+  // Age of the oldest OPEN, unexpired marker; >2 cron periods = wedged
+  // reaper (replaces R1's drainedAwaitingRetirement).
+  oldestOpenMarkerAgeSeconds: number;
+};
+
+export const computeRetirementKeepOut = (
+  builds: Record<string, RetiringBuildEntry>,
+  now: number,
+): RetirementKeepOut => {
+  const openBuilds = new Map<string, string[]>();
+  let expiredMarkers = 0;
+  let oldestOpenMarkerAgeSeconds = 0;
+  for (const [buildId, entry] of Object.entries(builds)) {
+    switch (entry.state) {
+      case "OPEN": {
+        if (entry.expiresAt < now) {
+          expiredMarkers += 1;
+          break;
+        }
+        openBuilds.set(
+          retiringBuildKey(entry.deploymentName, buildId),
+          Object.keys(entry.services),
+        );
+        oldestOpenMarkerAgeSeconds = Math.max(
+          oldestOpenMarkerAgeSeconds,
+          Math.floor((now - entry.createdAt) / 1_000),
+        );
+        break;
+      }
+      case "BURIED":
+      case "ABORTED":
+        break;
+      default: {
+        const unreachable: never = entry.state;
+        throw new Error(`Unhandled retirement marker state ${unreachable}`);
+      }
+    }
+  }
+  return { openBuilds, expiredMarkers, oldestOpenMarkerAgeSeconds };
+};
 
 const siblingsProtected = (
   service: PoolDemand["service"],
@@ -654,12 +717,12 @@ export class CapacityController {
     return { writes };
   }
 
-  // Two disjoint lanes partitioned by buildState. The batch retirement lane
-  // (DRAINED builds) runs FIRST — before maintenance routing and the live
-  // protected-scale-in lane — and the live lane never touches DRAINED
-  // services again. The retirement lane's ledger releases bump the ledger
-  // generation, so the live lane receives the lane's updated ledger view
-  // rather than the stale pre-lane snapshot.
+  // The live protected scale-in lane. DRAINED builds never enter it
+  // (scaleInEligible hard-false) and marker-kept-out builds are excluded from
+  // candidate selection below — retirement left the cycle entirely
+  // (retirement-v2 §2, I3): the iac retire verb owns zero → release →
+  // quiesce → delete for every build it has marked, and the R1 in-cycle
+  // batch retirement lane is deleted.
   private async reconcileProtectedScaleIn(params: {
     cycleId: string;
     authorityGeneration: number;
@@ -672,419 +735,17 @@ export class CapacityController {
     incompleteWorkerDeployments: string[];
     scaleIn: NonNullable<ReconcilerState["scaleIn"]>;
     maintenance?: MaintenanceRedeploy;
+    // Kept-out services (OPEN ∧ unexpired markers, minus live-conflict
+    // overrides): never selected for scale-in or maintenance.
+    keepOutServiceArns: ReadonlySet<string>;
     now: number;
   }): Promise<{
     writes: Array<Record<string, unknown>>;
     partial?: boolean;
     applied?: boolean;
   }> {
+    const writes: Array<Record<string, unknown>> = [];
     const activeDrains = await this.dependencies.state.listActiveDrains();
-    const retirement = await this.reconcileDrainedRetirements({
-      cycleId: params.cycleId,
-      authorityGeneration: params.authorityGeneration,
-      ledger: params.ledger,
-      demands: params.demands,
-      tasks: params.tasks,
-      staleReadCount: params.staleReadCount,
-      activeDrains,
-      now: params.now,
-    });
-    const live = await this.reconcileLiveScaleIn({
-      ...params,
-      ledger: retirement.ledger,
-      activeDrains,
-    });
-    return {
-      writes: [...retirement.writes, ...live.writes],
-      ...(retirement.partial || live.partial ? { partial: true } : {}),
-      ...(retirement.applied || live.applied ? { applied: true } : {}),
-    };
-  }
-
-  // The batch retirement lane (R1): every service of a DRAINED build is
-  // zeroed wholesale — one RETIREMENT record per service, one desiredCount=0
-  // write, one ledger-allocation release transaction per service, all
-  // services in the same cycle. DRAINED is Temporal's own assertion that no
-  // pollers or pinned workflows remain, so no telemetry, protection, or
-  // per-task drain handshake is required: task protection is stripped
-  // best-effort (ECS will not stop protected tasks) but a lapsed protection
-  // never blocks the lane — the failure mode where one protection-lapsed
-  // DRAINED candidate aborted scale-in for the whole environment is dead.
-  private async reconcileDrainedRetirements(params: {
-    cycleId: string;
-    authorityGeneration: number;
-    ledger: CapacityLedger;
-    demands: PoolDemand[];
-    tasks: ManagedTemporalTask[];
-    staleReadCount: number;
-    activeDrains: TemporalDrainRecord[];
-    now: number;
-  }): Promise<{
-    writes: Array<Record<string, unknown>>;
-    partial?: boolean;
-    applied?: boolean;
-    ledger: CapacityLedger;
-  }> {
-    const writes: Array<Record<string, unknown>> = [];
-    let partial = false;
-    let applied = false;
-    let ledger = params.ledger;
-    const retirements = await this.dependencies.state.listActiveRetirements();
-    const serviceByArn = new Map(
-      params.demands.map((demand) => [
-        demand.service.serviceArn,
-        demand.service,
-      ]),
-    );
-    const legacyDrainArns = new Set(
-      params.activeDrains.map((drain) => drain.serviceArn),
-    );
-
-    const releaseAllocation = async (
-      record: TemporalRetirementRecord,
-      priorDesiredCount: number,
-      taskVcpu: number,
-    ) => {
-      const released = await this.dependencies.state.claimRetirementRelease({
-        record,
-        cycleId: params.cycleId,
-        authorityGeneration: params.authorityGeneration,
-        ledger,
-        releasedVcpu: priorDesiredCount * taskVcpu,
-        now: params.now,
-      });
-      ledger = released.ledger;
-    };
-
-    // The actuation shared by fresh intents and ZEROING records resumed from
-    // a prior cycle that crashed or deferred between intent and actuation.
-    const actuate = async (
-      record: TemporalRetirementRecord,
-      service: ManagedTemporalService,
-    ) => {
-      // Strip protection best-effort: ECS will not stop protected tasks, but
-      // requiring live protection is exactly the F2 failure mode this lane
-      // kills; a strip failure only delays running->0 until expiry.
-      for (const task of params.tasks.filter(
-        (candidate) =>
-          candidate.serviceArn === service.serviceArn &&
-          candidate.protectionEnabled,
-      )) {
-        try {
-          await this.dependencies.aws.updateTaskProtection({
-            clusterArn: service.clusterArn,
-            taskArn: task.taskArn,
-            protectionEnabled: false,
-          });
-        } catch (error) {
-          console.error("Retirement task-protection strip failed; continuing", {
-            serviceArn: service.serviceArn,
-            taskArn: task.taskArn,
-            error: error instanceof Error ? error.message : String(error),
-          });
-        }
-      }
-      try {
-        const requestId = await this.dependencies.aws.zeroDesiredCount(service);
-        writes.push({
-          intentId: record.intentId,
-          serviceArn: service.serviceArn,
-          priorDesired: service.desiredCount,
-          desired: 0,
-          requestId,
-          result: "RETIREMENT_ZERO_APPLIED",
-        });
-      } catch (error) {
-        // Same posture as the scale-out actuation loop: one service's ECS
-        // write failure (drift or transient) journals as FAILED and defers to
-        // the next cycle instead of aborting the batch.
-        partial = true;
-        writes.push({
-          intentId: record.intentId,
-          serviceArn: service.serviceArn,
-          result: "RETIREMENT_ZERO_FAILED",
-          error: error instanceof Error ? error.message : String(error),
-        });
-        return;
-      }
-      await releaseAllocation(
-        record,
-        record.priorDesiredCount,
-        service.cpuUnits / 1024,
-      );
-      applied = true;
-    };
-
-    // Advance ZEROING records first: confirm, abort on a live rollback, fail
-    // on deadline, or resume. Each record advances in its own contention
-    // isolation so one lost race defers that record, not the batch.
-    const resumable: TemporalRetirementRecord[] = [];
-    const advanceRecord = async (record: TemporalRetirementRecord) => {
-      const service = serviceByArn.get(record.serviceArn);
-      if (!service) {
-        if (record.releasedLedgerGeneration === undefined) {
-          // The service is gone but the ledger release never committed: the
-          // allocation would sit as a phantom floor until the next wholesale
-          // plan write. The service's task shape is no longer observable, so
-          // price the release from the pool config.
-          await releaseAllocation(
-            record,
-            record.priorDesiredCount,
-            TEMPORAL_STABLE_POOLS[record.poolId].cpu / 1024,
-          );
-        }
-        // The iac retire verb deleted the zeroed service — terminal success.
-        await this.dependencies.state.completeRetirement({
-          record,
-          terminalState: "APPLIED",
-          reason: "SERVICE_DELETED",
-          now: params.now,
-        });
-        writes.push({
-          intentId: record.intentId,
-          serviceArn: record.serviceArn,
-          result: "RETIREMENT_SERVICE_DELETED",
-        });
-        applied = true;
-        return;
-      }
-      if (
-        service.buildState === "CURRENT" ||
-        service.buildState === "RAMPING" ||
-        service.buildState === "DRAINING"
-      ) {
-        // Break-glass rollback (SetCurrent back to this build) while a
-        // retirement was in flight: the build is live again, so abort
-        // instead of yo-yoing zero writes against the rollback. No release
-        // here — a live service's allocation is owned by the scale-out plan
-        // write, which rewrites the map wholesale. DRAINED->REGISTRATION is
-        // NOT an abort: a deregistered version can never route work, so the
-        // zero should proceed.
-        await this.dependencies.state.completeRetirement({
-          record,
-          terminalState: "FAILED",
-          reason: "BUILD_STATE_CHANGED",
-          now: params.now,
-        });
-        writes.push({
-          intentId: record.intentId,
-          serviceArn: record.serviceArn,
-          buildState: service.buildState,
-          result: "RETIREMENT_BUILD_STATE_CHANGED",
-        });
-        partial = true;
-        return;
-      }
-      if (
-        service.desiredCount === 0 &&
-        service.runningCount === 0 &&
-        service.pendingCount === 0
-      ) {
-        if (record.releasedLedgerGeneration === undefined) {
-          // The ECS zero landed but the ledger release never committed
-          // (crash or lost race between the two): the allocation is still a
-          // phantom floor — release it before closing the record.
-          await releaseAllocation(
-            record,
-            record.priorDesiredCount,
-            service.cpuUnits / 1024,
-          );
-        }
-        await this.dependencies.state.completeRetirement({
-          record,
-          terminalState: "APPLIED",
-          now: params.now,
-        });
-        writes.push({
-          intentId: record.intentId,
-          serviceArn: record.serviceArn,
-          result: "RETIREMENT_CONFIRMED",
-        });
-        applied = true;
-        return;
-      }
-      if (record.verifyDeadline < params.now) {
-        if (
-          service.desiredCount === 0 &&
-          record.releasedLedgerGeneration === undefined
-        ) {
-          // The zero landed but the release is still owed (deferred
-          // contention or a crash) and protection re-renewal kept tasks
-          // running past the deadline. FAILED is terminal and desired=0
-          // means the candidate filter never re-selects this service, so
-          // failing without the release would leak the allocation as a
-          // phantom floor until service deletion.
-          await releaseAllocation(
-            record,
-            record.priorDesiredCount,
-            service.cpuUnits / 1024,
-          );
-        }
-        await this.dependencies.state.completeRetirement({
-          record,
-          terminalState: "FAILED",
-          reason:
-            service.desiredCount > 0
-              ? "RETIREMENT_ZERO_NEVER_APPLIED"
-              : "RETIREMENT_RUNNING_NOT_STOPPED",
-          now: params.now,
-        });
-        writes.push({
-          intentId: record.intentId,
-          serviceArn: record.serviceArn,
-          result: "RETIREMENT_VERIFY_TIMEOUT",
-        });
-        partial = true;
-        return;
-      }
-      if (service.desiredCount > 0) resumable.push(record);
-    };
-    for (const record of retirements) {
-      try {
-        await advanceRecord(record);
-      } catch (error) {
-        if (!isRetriableDynamoContention(error)) throw error;
-        partial = true;
-        writes.push({
-          intentId: record.intentId,
-          serviceArn: record.serviceArn,
-          result: "RETIREMENT_DEFERRED_CONTENTION",
-        });
-      }
-    }
-
-    // Select fresh candidates: every DRAINED service still carrying desired
-    // capacity, minus in-flight retirements, legacy per-task drain records
-    // (transition safety), and deploys in progress. New intents require this
-    // cycle's Temporal read to be complete — a stale read cannot assert
-    // DRAINED.
-    const inFlight = new Set(retirements.map((record) => record.serviceArn));
-    const candidates =
-      params.staleReadCount > 0
-        ? []
-        : params.demands
-            .map((demand) => demand.service)
-            .filter(
-              (service) =>
-                service.buildState === "DRAINED" &&
-                service.desiredCount > 0 &&
-                !service.deploymentInProgress &&
-                !inFlight.has(service.serviceArn) &&
-                !legacyDrainArns.has(service.serviceArn),
-            )
-            .sort((left, right) =>
-              left.serviceArn.localeCompare(right.serviceArn),
-            );
-
-    // Sanity floor (DESIGN.md §3, mirroring the retire verb's
-    // RETIRE_MAX_BUILDS_PER_RUN): an absurd batch is evidence of a wrong
-    // worldview — refuse loudly rather than zero it.
-    const candidateBuilds = new Set(
-      candidates.map((service) => service.buildId),
-    );
-    let newCandidates = candidates;
-    if (candidateBuilds.size > TEMPORAL_RETIREMENT_MAX_BUILDS_PER_CYCLE) {
-      console.error(
-        "Refusing drained-retirement batch over the sanity floor; verify the world before raising it",
-        {
-          builds: candidateBuilds.size,
-          max: TEMPORAL_RETIREMENT_MAX_BUILDS_PER_CYCLE,
-        },
-      );
-      writes.push({
-        result: "RETIREMENT_FLOOR_REFUSED",
-        builds: candidateBuilds.size,
-        max: TEMPORAL_RETIREMENT_MAX_BUILDS_PER_CYCLE,
-      });
-      partial = true;
-      newCandidates = [];
-    }
-
-    for (const record of resumable) {
-      const service = serviceByArn.get(record.serviceArn);
-      if (!service) continue;
-      try {
-        await actuate(record, service);
-      } catch (error) {
-        if (!isRetriableDynamoContention(error)) throw error;
-        partial = true;
-        writes.push({
-          intentId: record.intentId,
-          serviceArn: record.serviceArn,
-          result: "RETIREMENT_DEFERRED_CONTENTION",
-        });
-      }
-    }
-    for (const service of newCandidates) {
-      const record: TemporalRetirementRecord = {
-        kind: "RETIREMENT",
-        serviceArn: service.serviceArn,
-        clusterArn: service.clusterArn,
-        poolId: service.poolId,
-        buildId: service.buildId,
-        intentId: randomUUID(),
-        cycleId: params.cycleId,
-        authorityGeneration: params.authorityGeneration,
-        ledgerGeneration: ledger.generation,
-        priorDesiredCount: service.desiredCount,
-        state: "ZEROING",
-        createdAt: params.now,
-        verifyDeadline:
-          params.now + TEMPORAL_RETIREMENT_VERIFY_TIMEOUT_SECONDS * 1_000,
-      };
-      try {
-        // Intent observable before execution, then actuate in the same cycle.
-        await this.dependencies.state.putRetirementIntent({
-          record,
-          now: params.now,
-        });
-        writes.push({
-          intentId: record.intentId,
-          serviceArn: service.serviceArn,
-          result: "RETIREMENT_INTENT_CREATED",
-        });
-        await actuate(record, service);
-      } catch (error) {
-        // One service's transient DynamoDB contention defers that service to
-        // the next cycle; it must not abort the rest of the batch.
-        if (!isRetriableDynamoContention(error)) throw error;
-        partial = true;
-        writes.push({
-          intentId: record.intentId,
-          serviceArn: record.serviceArn,
-          result: "RETIREMENT_DEFERRED_CONTENTION",
-        });
-      }
-    }
-    return {
-      writes,
-      ...(partial ? { partial: true } : {}),
-      ...(applied ? { applied: true } : {}),
-      ledger,
-    };
-  }
-
-  private async reconcileLiveScaleIn(params: {
-    cycleId: string;
-    authorityGeneration: number;
-    ledger: CapacityLedger;
-    demands: PoolDemand[];
-    observations: QueueCapacityObservation[];
-    workers: WorkerProcessObservation[];
-    tasks: ManagedTemporalTask[];
-    staleReadCount: number;
-    incompleteWorkerDeployments: string[];
-    scaleIn: NonNullable<ReconcilerState["scaleIn"]>;
-    maintenance?: MaintenanceRedeploy;
-    activeDrains: TemporalDrainRecord[];
-    now: number;
-  }): Promise<{
-    writes: Array<Record<string, unknown>>;
-    partial?: boolean;
-    applied?: boolean;
-  }> {
-    const writes: Array<Record<string, unknown>> = [];
-    const activeDrains = params.activeDrains;
     const activeDrain = activeDrains.toSorted(
       (left, right) => left.createdAt - right.createdAt,
     )[0];
@@ -1615,6 +1276,17 @@ export class CapacityController {
     }
 
     if (params.maintenance) {
+      // Keep-out (retirement-v2 §4.3): a maintenance record targeting a
+      // marked service defers untouched until the marker resolves — the verb
+      // owns the service's desiredCount/existence while the marker is OPEN.
+      if (params.keepOutServiceArns.has(params.maintenance.serviceArn)) {
+        writes.push({
+          maintenanceId: params.maintenance.maintenanceId,
+          serviceArn: params.maintenance.serviceArn,
+          result: "MAINTENANCE_DEFERRED_RETIRING",
+        });
+        return { writes, partial: true };
+      }
       return this.reconcileMaintenance({
         cycleId: params.cycleId,
         authorityGeneration: params.authorityGeneration,
@@ -1637,6 +1309,11 @@ export class CapacityController {
 
     const candidates = params.demands
       .filter((demand) => {
+        // Keep-out (retirement-v2 §4.3): marked services are excluded from
+        // live scale-in candidacy while their burial marker is OPEN.
+        if (params.keepOutServiceArns.has(demand.service.serviceArn)) {
+          return false;
+        }
         const observations = observationsForService(
           demand.service,
           params.observations,
@@ -1878,11 +1555,19 @@ export class CapacityController {
     let pendingTasks = 0;
     let desiredNotReadyReplicas = 0;
     let drainDeadlineExpired = 0;
-    let drainedAwaitingRetirement = 0;
-    let retirementVerifyTimeouts = 0;
+    let retirementMarkerLiveConflicts = 0;
+    let allocationDriftVcpu = 0;
+    let grantPendingVcpu = 0;
+    let grantsExpired = 0;
     let queueObservations: QueueCapacityObservation[] = [];
     let serviceTimes = control.reconciler.serviceTimes;
     const scaleIn = { ...control.reconciler.scaleIn };
+    // Retirement keep-out (retirement-v2 §4.3): OPEN ∧ unexpired markers,
+    // read atomically with the rest of the control snapshot.
+    const keepOut = computeRetirementKeepOut(
+      control.retiringBuilds.builds,
+      now,
+    );
     try {
       const awsRead = await this.dependencies.aws.read(
         control.ledger.activeReservationVcpu,
@@ -1931,18 +1616,61 @@ export class CapacityController {
       }, 0);
       const servicesWithCommitments = awsRead.services.map((service) => ({
         ...service,
-        committedDesiredCount: Math.max(
-          service.desiredCount,
-          Math.ceil(
-            (control.ledger.allocations[service.serviceArn] ?? 0) /
-              (service.cpuUnits / 1024),
-          ),
-        ),
+        // Marked services never take the committed-allocation floor: the
+        // ratcheted allocation re-upping a retiring build's demand is exactly
+        // the F5 vector the keep-out kills (retirement-v2 §4.3).
+        committedDesiredCount: keepOut.openBuilds.has(
+          retiringBuildKey(service.deploymentName, service.buildId),
+        )
+          ? service.desiredCount
+          : Math.max(
+              service.desiredCount,
+              Math.ceil(
+                (control.ledger.allocations[service.serviceArn] ?? 0) /
+                  (service.cpuUnits / 1024),
+              ),
+            ),
       }));
       const temporalRead = await this.dependencies.temporal.read(
         servicesWithCommitments,
+        // Mid-burial builds are exempt from the reader's active-build
+        // fail-loud check (I8): partial service deletion under an OPEN
+        // marker must degrade that build, never kill the env cycle.
+        { keepOutBuilds: new Set(keepOut.openBuilds.keys()) },
       );
       queueObservations = temporalRead.observations;
+      // Live-state override (rollback safety valve, retirement-v2 §4.3): a
+      // marked build observed CURRENT/RAMPING/DRAINING is live again —
+      // break-glass SetCurrent to a mid-burial build must never find its
+      // capacity frozen by a dead verb run. The controller ignores the
+      // keep-out for that build and emits RETIREMENT_MARKER_LIVE_CONFLICT
+      // (alarm >= 1); the verb's T5 recheck aborts its half of the race.
+      const liveConflictBuildKeys = new Set<string>();
+      for (const service of temporalRead.services) {
+        const key = retiringBuildKey(service.deploymentName, service.buildId);
+        if (!keepOut.openBuilds.has(key)) continue;
+        if (
+          service.buildState === "CURRENT" ||
+          service.buildState === "RAMPING" ||
+          service.buildState === "DRAINING"
+        ) {
+          liveConflictBuildKeys.add(key);
+        }
+      }
+      retirementMarkerLiveConflicts = liveConflictBuildKeys.size;
+      if (retirementMarkerLiveConflicts > 0) {
+        console.error(
+          "Retirement marker conflicts with live build state; keep-out overridden for the conflicted build(s)",
+          { builds: [...liveConflictBuildKeys] },
+        );
+      }
+      const keepOutServiceArns = new Set<string>();
+      for (const [key, serviceArns] of keepOut.openBuilds) {
+        if (liveConflictBuildKeys.has(key)) continue;
+        for (const serviceArn of serviceArns) {
+          keepOutServiceArns.add(serviceArn);
+        }
+      }
       const activeDrains = await this.dependencies.state.listActiveDrains();
       // Drop scale-in state for services that no longer exist. Every worker
       // deploy mints a fresh set of suffix-hashed ECS services, and nothing
@@ -1961,12 +1689,29 @@ export class CapacityController {
       for (const serviceArn of Object.keys(scaleIn)) {
         if (!liveScaleInArns.has(serviceArn)) delete scaleIn[serviceArn];
       }
+      // Keep-out (retirement-v2 §4.3): marked services' scaleIn entries are
+      // pruned — the verb owns them and any residual wave/eligibility state
+      // is stale by definition.
+      for (const serviceArn of keepOutServiceArns) {
+        delete scaleIn[serviceArn];
+      }
       const activeBuildPools = new Map<string, Set<TemporalStablePoolId>>();
       for (const service of temporalRead.services) {
         if (
           service.buildState !== "CURRENT" &&
           service.buildState !== "RAMPING" &&
           service.buildState !== "DRAINING"
+        ) {
+          continue;
+        }
+        // Marked builds are exempt from the required-pool fail-loud check
+        // below (I8): a mid-burial build whose services are half-deleted
+        // must not fail the env-wide cycle, even when a rollback made it
+        // active again (the conflict metric above is the signal).
+        if (
+          keepOut.openBuilds.has(
+            retiringBuildKey(service.deploymentName, service.buildId),
+          )
         ) {
           continue;
         }
@@ -2010,24 +1755,6 @@ export class CapacityController {
           );
         }
       }
-      // Builds fully zeroed by the retirement lane but not yet deleted by the
-      // iac retire verb: the verb's defer rule clears once desired+running
-      // reach zero, so a sustained nonzero count means the reaper is wedged.
-      const drainedBuildResidualCapacity = new Map<string, number>();
-      for (const service of temporalRead.services) {
-        if (service.buildState !== "DRAINED") continue;
-        const key = `${service.environment}#${service.deploymentName}#${service.buildId}`;
-        drainedBuildResidualCapacity.set(
-          key,
-          (drainedBuildResidualCapacity.get(key) ?? 0) +
-            service.desiredCount +
-            service.runningCount +
-            service.pendingCount,
-        );
-      }
-      drainedAwaitingRetirement = [
-        ...drainedBuildResidualCapacity.values(),
-      ].filter((residual) => residual === 0).length;
       staleTemporalInputs =
         temporalRead.observations.filter((observation) => !observation.fresh)
           .length + temporalRead.staleReadCount;
@@ -2045,11 +1772,51 @@ export class CapacityController {
           observationsForService(service, temporalRead.observations),
         ),
       );
-      const allocation = allocateGlobalCapacity(demands, {
+      // Keep-out (retirement-v2 §4.3): marked services are excluded from
+      // allocation — the controller never scales a build the verb is
+      // burying. Live-conflict overrides were already subtracted above, so a
+      // rolled-back build's capacity is not frozen by a dead verb run.
+      const allocatableDemands = demands.filter(
+        (demand) => !keepOutServiceArns.has(demand.service.serviceArn),
+      );
+      const allocation = allocateGlobalCapacity(allocatableDemands, {
         ...awsRead.snapshot,
         activeReservationVcpu:
           awsRead.snapshot.activeReservationVcpu + ledgerPendingVcpu,
       });
+      // ─── Ledger v2 Phase A (retirement-v2 §3) ───
+      // AllocationDriftVcpu = Σ max(0, charged − observed): the phantom mass
+      // the Phase B flip will reclaim, measured before any behavior change.
+      allocationDriftVcpu = ledgerPendingVcpu;
+      // Reconcile the grant book against this cycle's existing single
+      // inventory read (no new reads): delete when observed >= granted, the
+      // service is gone, or the grant expired. Expiry is the typed
+      // GrantExpired signal — ECS never delivered — that the allocations
+      // ratchet silently absorbed.
+      const observedVcpuByArn = new Map(
+        awsRead.services.map((service) => [
+          service.serviceArn,
+          Math.max(
+            service.desiredCount,
+            service.runningCount + service.pendingCount,
+          ) *
+            (service.cpuUnits / 1024),
+        ]),
+      );
+      const carriedGrants: Record<string, CapacityGrant> = {};
+      for (const [serviceArn, grant] of Object.entries(
+        control.ledger.grants ?? {},
+      )) {
+        const observedVcpu = observedVcpuByArn.get(serviceArn);
+        if (observedVcpu === undefined) continue;
+        if (observedVcpu >= grant.vcpu) continue;
+        if (grant.expiresAt < now) {
+          grantsExpired += 1;
+          continue;
+        }
+        carriedGrants[serviceArn] = grant;
+        grantPendingVcpu += Math.max(0, grant.vcpu - observedVcpu);
+      }
       ungrantedProdReplicas = allocation.ungrantedProdReplicas;
       inputHash = stableHash({
         inventoryHash: awsRead.inventoryHash,
@@ -2099,6 +1866,7 @@ export class CapacityController {
               temporalRead.incompleteWorkerDeployments,
             scaleIn,
             maintenance,
+            keepOutServiceArns,
             now: Date.now(),
           });
           audit.scaleInWrites = scaleInResult.writes;
@@ -2106,9 +1874,6 @@ export class CapacityController {
             (write) =>
               write.result === "CANCELLED" &&
               write.reason === "DRAIN_DEADLINE_EXPIRED",
-          ).length;
-          retirementVerifyTimeouts = scaleInResult.writes.filter(
-            (write) => write.result === "RETIREMENT_VERIFY_TIMEOUT",
           ).length;
           result = scaleInResult.partial
             ? "PARTIAL"
@@ -2142,8 +1907,35 @@ export class CapacityController {
           (total, grant) => total + grant.additionalVcpu,
           0,
         );
-        const ledgerGeneration =
-          await this.dependencies.state.claimCapacityPlan({
+        // Phase A grant book (retirement-v2 §3.1): carried-forward unexpired
+        // grants plus a fresh TTL'd grant for every service this plan grants
+        // above its observed desired count. A re-grant at the same or lower
+        // vcpu keeps the original expiry — the TTL bounds how long ECS
+        // non-delivery can charge admission, and refreshing it on every
+        // cycle would recreate the ratchet with extra steps.
+        const nextGrants: Record<string, CapacityGrant> = { ...carriedGrants };
+        for (const grant of updates) {
+          const serviceArn = grant.service.serviceArn;
+          const grantedVcpu = grant.granted * (grant.service.cpuUnits / 1024);
+          const existing = carriedGrants[serviceArn];
+          nextGrants[serviceArn] = {
+            vcpu: grantedVcpu,
+            expiresAt:
+              existing && existing.vcpu >= grantedVcpu
+                ? existing.expiresAt
+                : now + TEMPORAL_CAPACITY_GRANT_TTL_MS,
+          };
+        }
+        // A generation race with an out-of-cycle admission write
+        // (admitReservation / releaseReservation / a retirement-release
+        // landing between this cycle's snapshot and the plan claim) is the
+        // expected benign contention, not a Lambda error: resolve it as a
+        // PARTIAL cycle and retry from fresh inputs next cycle — the same
+        // isolation posture as the protected scale-in step (adversarial-gate
+        // fix, 2026-07-18).
+        let planClaim: number | undefined;
+        try {
+          planClaim = await this.dependencies.state.claimCapacityPlan({
             cycleId,
             authorityGeneration: control.authority.generation,
             ledger: control.ledger,
@@ -2151,152 +1943,95 @@ export class CapacityController {
             observedManagedVcpu: awsRead.snapshot.managedCommittedVcpu,
             pendingLedgerVcpu: ledgerPendingVcpu,
             allocations: allocationsForGrants(allocation.grants),
+            grants: nextGrants,
             inventoryHash: awsRead.inventoryHash,
             now: Date.now(),
           });
-        const writes: Array<Record<string, unknown>> = [];
-        let partial = false;
-        const freshControl =
-          await this.dependencies.state.readControlSnapshot();
-        if (freshControl.ledger.generation !== ledgerGeneration) {
-          partial = true;
-        }
-        const freshAws = await this.dependencies.aws.read(
-          freshControl.ledger.activeReservationVcpu,
-        );
-        const plannedManagedVcpu =
-          awsRead.snapshot.managedCommittedVcpu +
-          ledgerPendingVcpu +
-          additionalManagedVcpu;
-        const freshCommittedVcpu =
-          Math.max(plannedManagedVcpu, freshAws.snapshot.managedCommittedVcpu) +
-          freshAws.snapshot.unmanagedCommittedVcpu +
-          freshAws.snapshot.activeReservationVcpu;
-        const quotaCeilingVcpu =
-          freshAws.snapshot.quotaVcpu - freshAws.snapshot.hardReserveVcpu;
-        // Environment-budget twin of the quota ceiling: env-scoped committed
-        // (managed + reservations, no unmanaged) must stay inside the static
-        // partition even if inputs moved since allocation.
-        const freshEnvCommittedVcpu =
-          Math.max(plannedManagedVcpu, freshAws.snapshot.managedCommittedVcpu) +
-          freshAws.snapshot.activeReservationVcpu;
-        const envBudgetCeilingVcpu =
-          this.config.environmentVcpuBudget ?? Number.POSITIVE_INFINITY;
-        const liveServices = new Map(
-          freshAws.services.map((service) => [service.serviceArn, service]),
-        );
-        const expectedDesired = new Map(
-          updates.map((grant) => [
-            grant.service.serviceArn,
-            grant.service.desiredCount,
-          ]),
-        );
-        const changedService = updates.find((grant) => {
-          const live = liveServices.get(grant.service.serviceArn);
-          return (
-            !live ||
-            live.desiredCount !==
-              expectedDesired.get(grant.service.serviceArn) ||
-            live.taskDefinitionArn !== grant.service.taskDefinitionArn ||
-            live.cpuUnits !== grant.service.cpuUnits
+        } catch (error) {
+          if (!isRetriableDynamoContention(error)) throw error;
+          audit.planDeferred =
+            error instanceof Error ? error.message : String(error);
+          console.error(
+            "Capacity plan claim lost a generation race to an out-of-cycle write; cycle resolves PARTIAL and retries from fresh inputs",
+            { cycleId, error },
           );
-        });
-        if (
-          partial ||
-          freshCommittedVcpu > quotaCeilingVcpu ||
-          freshEnvCommittedVcpu > envBudgetCeilingVcpu ||
-          changedService !== undefined
-        ) {
-          partial = true;
-          writes.push({
-            result: "AWS_INPUT_CHANGED",
-            freshCommittedVcpu,
-            quotaCeilingVcpu,
-            ...(this.config.environmentVcpuBudget !== undefined
-              ? { freshEnvCommittedVcpu, envBudgetCeilingVcpu }
-              : {}),
-            ...(changedService
-              ? { serviceArn: changedService.service.serviceArn }
-              : {}),
-          });
         }
-        for (const grant of partial ? [] : updates) {
+        if (planClaim === undefined) {
+          result = "PARTIAL";
+        } else {
+          const ledgerGeneration = planClaim;
+          const writes: Array<Record<string, unknown>> = [];
+          let partial = false;
+          const freshControl =
+            await this.dependencies.state.readControlSnapshot();
+          if (freshControl.ledger.generation !== ledgerGeneration) {
+            partial = true;
+          }
+          const freshAws = await this.dependencies.aws.read(
+            freshControl.ledger.activeReservationVcpu,
+          );
+          const plannedManagedVcpu =
+            awsRead.snapshot.managedCommittedVcpu +
+            ledgerPendingVcpu +
+            additionalManagedVcpu;
+          const freshCommittedVcpu =
+            Math.max(
+              plannedManagedVcpu,
+              freshAws.snapshot.managedCommittedVcpu,
+            ) +
+            freshAws.snapshot.unmanagedCommittedVcpu +
+            freshAws.snapshot.activeReservationVcpu;
+          const quotaCeilingVcpu =
+            freshAws.snapshot.quotaVcpu - freshAws.snapshot.hardReserveVcpu;
+          // Environment-budget twin of the quota ceiling: env-scoped committed
+          // (managed + reservations, no unmanaged) must stay inside the static
+          // partition even if inputs moved since allocation.
+          const freshEnvCommittedVcpu =
+            Math.max(
+              plannedManagedVcpu,
+              freshAws.snapshot.managedCommittedVcpu,
+            ) + freshAws.snapshot.activeReservationVcpu;
+          const envBudgetCeilingVcpu =
+            this.config.environmentVcpuBudget ?? Number.POSITIVE_INFINITY;
+          const liveServices = new Map(
+            freshAws.services.map((service) => [service.serviceArn, service]),
+          );
+          const expectedDesired = new Map(
+            updates.map((grant) => [
+              grant.service.serviceArn,
+              grant.service.desiredCount,
+            ]),
+          );
+          const changedService = updates.find((grant) => {
+            const live = liveServices.get(grant.service.serviceArn);
+            return (
+              !live ||
+              live.desiredCount !==
+                expectedDesired.get(grant.service.serviceArn) ||
+              live.taskDefinitionArn !== grant.service.taskDefinitionArn ||
+              live.cpuUnits !== grant.service.cpuUnits
+            );
+          });
           if (
-            !(await this.dependencies.state.verifyWriteFence({
-              cycleId,
-              authorityGeneration: control.authority.generation,
-              ledgerGeneration,
-              now: Date.now(),
-            }))
+            partial ||
+            freshCommittedVcpu > quotaCeilingVcpu ||
+            freshEnvCommittedVcpu > envBudgetCeilingVcpu ||
+            changedService !== undefined
           ) {
             partial = true;
             writes.push({
-              serviceArn: grant.service.serviceArn,
-              result: "FENCE_CHANGED",
+              result: "AWS_INPUT_CHANGED",
+              freshCommittedVcpu,
+              quotaCeilingVcpu,
+              ...(this.config.environmentVcpuBudget !== undefined
+                ? { freshEnvCommittedVcpu, envBudgetCeilingVcpu }
+                : {}),
+              ...(changedService
+                ? { serviceArn: changedService.service.serviceArn }
+                : {}),
             });
-            break;
           }
-          try {
-            const currentControl =
-              await this.dependencies.state.readControlSnapshot();
-            if (currentControl.ledger.generation !== ledgerGeneration) {
-              throw new Error(
-                "Capacity ledger changed before actuation; retrying from fresh inputs",
-              );
-            }
-            const currentAws = await this.dependencies.aws.read(
-              currentControl.ledger.activeReservationVcpu,
-            );
-            const currentCommittedVcpu =
-              Math.max(
-                plannedManagedVcpu,
-                currentAws.snapshot.managedCommittedVcpu,
-              ) +
-              currentAws.snapshot.unmanagedCommittedVcpu +
-              currentAws.snapshot.activeReservationVcpu;
-            const currentCeilingVcpu =
-              currentAws.snapshot.quotaVcpu -
-              currentAws.snapshot.hardReserveVcpu;
-            const liveService = currentAws.services.find(
-              (service) => service.serviceArn === grant.service.serviceArn,
-            );
-            if (!liveService) {
-              throw new Error(
-                `Managed service ${grant.service.serviceArn} disappeared before actuation`,
-              );
-            }
-            if (
-              liveService.desiredCount !==
-              expectedDesired.get(grant.service.serviceArn)
-            ) {
-              throw new Error(
-                `Managed service ${grant.service.serviceArn} desired count changed before actuation`,
-              );
-            }
-            if (currentCommittedVcpu > currentCeilingVcpu) {
-              throw new Error(
-                `Fargate capacity changed before actuation: committed=${currentCommittedVcpu} ceiling=${currentCeilingVcpu}`,
-              );
-            }
-            const currentEnvCommittedVcpu =
-              Math.max(
-                plannedManagedVcpu,
-                currentAws.snapshot.managedCommittedVcpu,
-              ) + currentAws.snapshot.activeReservationVcpu;
-            if (currentEnvCommittedVcpu > envBudgetCeilingVcpu) {
-              throw new Error(
-                `Environment capacity changed before actuation: committed=${currentEnvCommittedVcpu} budget=${envBudgetCeilingVcpu}`,
-              );
-            }
-            if (
-              liveService.taskDefinitionArn !==
-                grant.service.taskDefinitionArn ||
-              liveService.cpuUnits !== grant.service.cpuUnits
-            ) {
-              throw new Error(
-                `Managed service ${grant.service.serviceArn} task shape changed before actuation`,
-              );
-            }
+          for (const grant of partial ? [] : updates) {
             if (
               !(await this.dependencies.state.verifyWriteFence({
                 cycleId,
@@ -2305,33 +2040,110 @@ export class CapacityController {
                 now: Date.now(),
               }))
             ) {
-              throw new Error(
-                "Capacity write fence changed during final AWS revalidation",
-              );
+              partial = true;
+              writes.push({
+                serviceArn: grant.service.serviceArn,
+                result: "FENCE_CHANGED",
+              });
+              break;
             }
-            const requestId = await this.dependencies.aws.updateDesiredCount(
-              liveService,
-              grant.granted,
-            );
-            expectedDesired.set(grant.service.serviceArn, grant.granted);
-            writes.push({
-              serviceArn: grant.service.serviceArn,
-              priorDesired: grant.priorDesired,
-              desired: grant.granted,
-              requestId,
-              result: "APPLIED",
-            });
-          } catch (error) {
-            partial = true;
-            writes.push({
-              serviceArn: grant.service.serviceArn,
-              result: "FAILED",
-              error: error instanceof Error ? error.message : String(error),
-            });
+            try {
+              const currentControl =
+                await this.dependencies.state.readControlSnapshot();
+              if (currentControl.ledger.generation !== ledgerGeneration) {
+                throw new Error(
+                  "Capacity ledger changed before actuation; retrying from fresh inputs",
+                );
+              }
+              const currentAws = await this.dependencies.aws.read(
+                currentControl.ledger.activeReservationVcpu,
+              );
+              const currentCommittedVcpu =
+                Math.max(
+                  plannedManagedVcpu,
+                  currentAws.snapshot.managedCommittedVcpu,
+                ) +
+                currentAws.snapshot.unmanagedCommittedVcpu +
+                currentAws.snapshot.activeReservationVcpu;
+              const currentCeilingVcpu =
+                currentAws.snapshot.quotaVcpu -
+                currentAws.snapshot.hardReserveVcpu;
+              const liveService = currentAws.services.find(
+                (service) => service.serviceArn === grant.service.serviceArn,
+              );
+              if (!liveService) {
+                throw new Error(
+                  `Managed service ${grant.service.serviceArn} disappeared before actuation`,
+                );
+              }
+              if (
+                liveService.desiredCount !==
+                expectedDesired.get(grant.service.serviceArn)
+              ) {
+                throw new Error(
+                  `Managed service ${grant.service.serviceArn} desired count changed before actuation`,
+                );
+              }
+              if (currentCommittedVcpu > currentCeilingVcpu) {
+                throw new Error(
+                  `Fargate capacity changed before actuation: committed=${currentCommittedVcpu} ceiling=${currentCeilingVcpu}`,
+                );
+              }
+              const currentEnvCommittedVcpu =
+                Math.max(
+                  plannedManagedVcpu,
+                  currentAws.snapshot.managedCommittedVcpu,
+                ) + currentAws.snapshot.activeReservationVcpu;
+              if (currentEnvCommittedVcpu > envBudgetCeilingVcpu) {
+                throw new Error(
+                  `Environment capacity changed before actuation: committed=${currentEnvCommittedVcpu} budget=${envBudgetCeilingVcpu}`,
+                );
+              }
+              if (
+                liveService.taskDefinitionArn !==
+                  grant.service.taskDefinitionArn ||
+                liveService.cpuUnits !== grant.service.cpuUnits
+              ) {
+                throw new Error(
+                  `Managed service ${grant.service.serviceArn} task shape changed before actuation`,
+                );
+              }
+              if (
+                !(await this.dependencies.state.verifyWriteFence({
+                  cycleId,
+                  authorityGeneration: control.authority.generation,
+                  ledgerGeneration,
+                  now: Date.now(),
+                }))
+              ) {
+                throw new Error(
+                  "Capacity write fence changed during final AWS revalidation",
+                );
+              }
+              const requestId = await this.dependencies.aws.updateDesiredCount(
+                liveService,
+                grant.granted,
+              );
+              expectedDesired.set(grant.service.serviceArn, grant.granted);
+              writes.push({
+                serviceArn: grant.service.serviceArn,
+                priorDesired: grant.priorDesired,
+                desired: grant.granted,
+                requestId,
+                result: "APPLIED",
+              });
+            } catch (error) {
+              partial = true;
+              writes.push({
+                serviceArn: grant.service.serviceArn,
+                result: "FAILED",
+                error: error instanceof Error ? error.message : String(error),
+              });
+            }
           }
+          audit.writes = writes;
+          result = partial ? "PARTIAL" : "APPLIED";
         }
-        audit.writes = writes;
-        result = partial ? "PARTIAL" : "APPLIED";
       }
     } catch (error) {
       audit.error = error instanceof Error ? error.message : String(error);
@@ -2363,8 +2175,12 @@ export class CapacityController {
             pendingTasks,
             desiredNotReadyReplicas,
             drainDeadlineExpired,
-            drainedAwaitingRetirement,
-            retirementVerifyTimeouts,
+            openRetirementMarkerAgeSeconds: keepOut.oldestOpenMarkerAgeSeconds,
+            expiredRetirementMarkers: keepOut.expiredMarkers,
+            retirementMarkerLiveConflicts,
+            allocationDriftVcpu,
+            grantPendingVcpu,
+            grantsExpired,
           });
         } catch (error) {
           console.error(
@@ -2696,6 +2512,263 @@ export class CapacityController {
     throw new Error("Reservation release retries exhausted");
   }
 
+  // ─── Retirement v2 marker ops (design doc 2026-07-18 §2.5, §4.2) ───
+  // Synchronous data-plane operations invoked by the iac retire verb through
+  // the reserve/release invoke-retry protocol (Q1 ruling: the verb keeps the
+  // burial sequencing; this Lambda is the dumb fenced writer). Each retries
+  // generation drift up to 5 times like reserveDeployment, and every op is
+  // idempotent under byte-identical resend.
+
+  private assertRetirementScope(environment: CapacityEnvironment) {
+    if (
+      this.config.environmentScope !== undefined &&
+      environment !== this.config.environmentScope
+    ) {
+      throw new Error(
+        `Retirement environment ${environment} is not admissible on the ${this.config.environmentScope}-scoped controller`,
+      );
+    }
+  }
+
+  // T0 BEGIN. Returns begun=false with a typed reason when a FOREIGN, live
+  // marker holds the build — the verb defers that build (overlap safety),
+  // it is not an error. Re-beginning a build whose OPEN marker expired
+  // carries the dead run's releasedLedgerGeneration stamps forward so a
+  // resumed T3 stays idempotent (no double managedCommittedVcpu decrement);
+  // terminal entries do NOT carry stamps — a BURIED build's redeployed
+  // same-ARN successor owes its own releases.
+  async beginRetirement(params: RetirementBeginInput) {
+    const now = Date.now();
+    this.assertRetirementScope(params.environment);
+    await this.dependencies.state.initialize();
+    for (let attempt = 1; attempt <= 5; attempt += 1) {
+      const control = await this.dependencies.state.readControlSnapshot();
+      if (control.authority.writerKind !== "STEP_FUNCTIONS_LAMBDA") {
+        throw new Error(
+          "Retirement marker ops require controller writer authority",
+        );
+      }
+      const existing = control.retiringBuilds.builds[params.buildId];
+      if (
+        existing &&
+        existing.state === "OPEN" &&
+        existing.intentId !== params.intentId &&
+        existing.expiresAt >= now
+      ) {
+        return { begun: false as const, reason: "MARKER_HELD" as const };
+      }
+      const carriedStamps =
+        existing && existing.state === "OPEN" ? existing.services : {};
+      const pruneBuildIds = Object.entries(control.retiringBuilds.builds)
+        .filter(([, entry]) => entry.state !== "OPEN")
+        .map(([buildId]) => buildId);
+      try {
+        await this.dependencies.state.beginRetirement({
+          authorityGeneration: control.authority.generation,
+          buildId: params.buildId,
+          entry: {
+            intentId: params.intentId,
+            deploymentName: params.deploymentName,
+            environment: params.environment,
+            services: Object.fromEntries(
+              params.services.map((service) => [
+                service.serviceArn,
+                {
+                  priorDesired: service.priorDesired,
+                  ...(carriedStamps[service.serviceArn]
+                    ?.releasedLedgerGeneration !== undefined
+                    ? {
+                        releasedLedgerGeneration:
+                          carriedStamps[service.serviceArn]
+                            ?.releasedLedgerGeneration,
+                      }
+                    : {}),
+                },
+              ]),
+            ),
+            expiresAt: params.expiresAt,
+          },
+          pruneBuildIds,
+          now,
+        });
+        return { begun: true as const };
+      } catch (error) {
+        if (
+          !this.dependencies.state.isConditionalFailure(error) ||
+          attempt === 5
+        ) {
+          throw error;
+        }
+      }
+    }
+    throw new Error("Retirement begin retries exhausted");
+  }
+
+  // T3 RELEASE: deploy admission unfreezes here — seconds after the zero,
+  // not after tasks die, not after a cron cycle. Idempotent by the
+  // releasedLedgerGeneration stamp written in the same transaction.
+  async releaseRetirement(params: RetirementReleaseInput) {
+    const now = Date.now();
+    await this.dependencies.state.initialize();
+    for (let attempt = 1; attempt <= 5; attempt += 1) {
+      const control = await this.dependencies.state.readControlSnapshot();
+      if (control.authority.writerKind !== "STEP_FUNCTIONS_LAMBDA") {
+        throw new Error(
+          "Retirement marker ops require controller writer authority",
+        );
+      }
+      const entry = control.retiringBuilds.builds[params.buildId];
+      if (!entry || entry.intentId !== params.intentId) {
+        throw new Error(
+          `Retirement marker for build ${params.buildId} is absent or owned by another run`,
+        );
+      }
+      const service = entry.services[params.serviceArn];
+      if (!service) {
+        throw new Error(
+          `Service ${params.serviceArn} is not part of the retirement marker for build ${params.buildId}`,
+        );
+      }
+      if (service.releasedLedgerGeneration !== undefined) {
+        return {
+          released: false as const,
+          alreadyReleased: true as const,
+          ledgerGeneration: service.releasedLedgerGeneration,
+        };
+      }
+      if (entry.state !== "OPEN") {
+        throw new Error(
+          `Retirement marker for build ${params.buildId} is ${entry.state}; release is only valid on OPEN`,
+        );
+      }
+      // Pool identity (and so vCPU pricing) derives from the service name.
+      // Unknown segments price at zero: the allocations clamp and grant
+      // delete still land, and managedCommittedVcpu recomputes wholesale
+      // from observation at the next plan write.
+      const poolId = temporalPoolIdForServiceName(params.serviceArn);
+      const taskVcpu = poolId ? TEMPORAL_STABLE_POOLS[poolId].cpu / 1024 : 0;
+      try {
+        const ledgerGeneration =
+          await this.dependencies.state.releaseRetirementLedger({
+            authorityGeneration: control.authority.generation,
+            ledger: control.ledger,
+            buildId: params.buildId,
+            intentId: params.intentId,
+            serviceArn: params.serviceArn,
+            releasedVcpu: service.priorDesired * taskVcpu,
+            now,
+          });
+        return { released: true as const, ledgerGeneration };
+      } catch (error) {
+        if (
+          !this.dependencies.state.isConditionalFailure(error) ||
+          attempt === 5
+        ) {
+          throw error;
+        }
+      }
+    }
+    throw new Error("Retirement release retries exhausted");
+  }
+
+  // Terminal edges (I5). Both are idempotent under resend: an entry already
+  // in the requested terminal state under the same intentId succeeds, and an
+  // entry pruned after termination reports done rather than failing the
+  // verb's retry protocol.
+  async abortRetirement(params: RetirementAbortInput) {
+    const now = Date.now();
+    await this.dependencies.state.initialize();
+    for (let attempt = 1; attempt <= 5; attempt += 1) {
+      const control = await this.dependencies.state.readControlSnapshot();
+      if (control.authority.writerKind !== "STEP_FUNCTIONS_LAMBDA") {
+        throw new Error(
+          "Retirement marker ops require controller writer authority",
+        );
+      }
+      const entry = control.retiringBuilds.builds[params.buildId];
+      if (!entry) return { aborted: true as const, reason: params.reason };
+      if (entry.intentId !== params.intentId) {
+        throw new Error(
+          `Retirement marker for build ${params.buildId} is owned by another run`,
+        );
+      }
+      if (entry.state === "ABORTED") {
+        return { aborted: true as const, reason: params.reason };
+      }
+      if (entry.state === "BURIED") {
+        throw new Error(
+          `Retirement marker for build ${params.buildId} is BURIED; abort after close is a protocol error`,
+        );
+      }
+      try {
+        await this.dependencies.state.abortRetirement({
+          authorityGeneration: control.authority.generation,
+          buildId: params.buildId,
+          intentId: params.intentId,
+          reason: params.reason,
+          now,
+        });
+        return { aborted: true as const, reason: params.reason };
+      } catch (error) {
+        if (
+          !this.dependencies.state.isConditionalFailure(error) ||
+          attempt === 5
+        ) {
+          throw error;
+        }
+      }
+    }
+    throw new Error("Retirement abort retries exhausted");
+  }
+
+  // T7 CLOSE: marker closure — the last obligation of the burial.
+  async closeRetirement(params: RetirementCloseInput) {
+    const now = Date.now();
+    await this.dependencies.state.initialize();
+    for (let attempt = 1; attempt <= 5; attempt += 1) {
+      const control = await this.dependencies.state.readControlSnapshot();
+      if (control.authority.writerKind !== "STEP_FUNCTIONS_LAMBDA") {
+        throw new Error(
+          "Retirement marker ops require controller writer authority",
+        );
+      }
+      const entry = control.retiringBuilds.builds[params.buildId];
+      if (!entry) return { closed: true as const };
+      if (entry.intentId !== params.intentId) {
+        throw new Error(
+          `Retirement marker for build ${params.buildId} is owned by another run`,
+        );
+      }
+      if (entry.state === "BURIED") return { closed: true as const };
+      if (entry.state === "ABORTED") {
+        throw new Error(
+          `Retirement marker for build ${params.buildId} is ABORTED; close after abort is a protocol error`,
+        );
+      }
+      const pruneBuildIds = Object.entries(control.retiringBuilds.builds)
+        .filter(([, candidate]) => candidate.state !== "OPEN")
+        .map(([buildId]) => buildId);
+      try {
+        await this.dependencies.state.closeRetirement({
+          authorityGeneration: control.authority.generation,
+          buildId: params.buildId,
+          intentId: params.intentId,
+          pruneBuildIds,
+          now,
+        });
+        return { closed: true as const };
+      } catch (error) {
+        if (
+          !this.dependencies.state.isConditionalFailure(error) ||
+          attempt === 5
+        ) {
+          throw error;
+        }
+      }
+    }
+    throw new Error("Retirement close retries exhausted");
+  }
+
   async updateManagedService(
     params: Parameters<AwsCapacityReader["updateManagedService"]>[0] & {
       reservationId?: string;
@@ -2940,7 +3013,16 @@ export class CapacityController {
     }
     let temporalRead: Awaited<ReturnType<TemporalCapacityReader["read"]>>;
     try {
-      temporalRead = await this.dependencies.temporal.read(awsRead.services);
+      // Marker-exempt like the reconcile read (retirement-v2 §4.3, I8): a
+      // mid-burial build must not flip the load gate closed env-wide.
+      temporalRead = await this.dependencies.temporal.read(awsRead.services, {
+        keepOutBuilds: new Set(
+          computeRetirementKeepOut(
+            control.retiringBuilds.builds,
+            Date.now(),
+          ).openBuilds.keys(),
+        ),
+      });
     } catch (error) {
       console.error("Capacity load gate Temporal read failed", error);
       try {

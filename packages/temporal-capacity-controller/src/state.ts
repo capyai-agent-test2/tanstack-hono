@@ -16,11 +16,13 @@ import { gunzipSync, gzipSync } from "node:zlib";
 import {
   getTemporalDrainSortKey,
   getTemporalMaintenanceSortKey,
-  getTemporalRetirementSortKey,
-  type TemporalRetirementRecord,
+  type RetirementAbortReason,
+  type RetiringBuildEntry,
+  type RetiringBuilds,
 } from "@capy/shared/temporal/capacity";
 
 import type {
+  CapacityGrant,
   CapacityLedger,
   CapacityReservation,
   ControllerConfig,
@@ -36,6 +38,11 @@ type ControlSnapshot = {
   authority: WriterAuthority;
   ledger: CapacityLedger;
   reconciler: ReconcilerState;
+  // Retirement keep-out markers (retirement-v2 §4.1): read atomically with
+  // authority/ledger/reconciler at zero added read cost. Tolerate-absent —
+  // unlike the other three members, an environment that predates the marker
+  // item must not fail every snapshot read; initialize() seeds it.
+  retiringBuilds: RetiringBuilds;
 };
 
 const encode = (value: Record<string, unknown>) =>
@@ -270,6 +277,18 @@ export class CapacityStateStore {
             }),
           }),
         ),
+        this.client.send(
+          new UpdateItemCommand({
+            TableName: this.config.tableName,
+            Key: itemKey(this.config, "RETIRING_BUILDS"),
+            UpdateExpression:
+              "SET builds = if_not_exists(builds, :builds), updatedAt = if_not_exists(updatedAt, :now)",
+            ExpressionAttributeValues: encode({
+              ":builds": {},
+              ":now": now,
+            }),
+          }),
+        ),
       ]);
       const failures = results.flatMap((result) =>
         result.status === "rejected" ? [result.reason] : [],
@@ -323,6 +342,12 @@ export class CapacityStateStore {
               Key: itemKey(this.config, "RECONCILER"),
             },
           },
+          {
+            Get: {
+              TableName: this.config.tableName,
+              Key: itemKey(this.config, "RETIRING_BUILDS"),
+            },
+          },
         ],
       }),
     );
@@ -331,10 +356,22 @@ export class CapacityStateStore {
     );
     const ledger = decodeItem<CapacityLedger>(response.Responses?.[1]?.Item);
     const reconciler = decodeReconciler(response.Responses?.[2]?.Item);
+    // Tolerate-absent (retirement-v2 §4.1): the marker item is seeded by
+    // initialize(), but a snapshot read racing the very first bootstrap (or a
+    // pre-marker environment) must degrade to "no markers", never fail the
+    // cycle the way the three mandatory members do.
+    const retiringBuilds = decodeItem<RetiringBuilds>(
+      response.Responses?.[3]?.Item,
+    ) ?? { builds: {} };
     if (!authority || !ledger || !reconciler) {
       throw new Error("Capacity control state is incomplete");
     }
-    return { authority, ledger, reconciler };
+    return {
+      authority,
+      ledger,
+      reconciler,
+      retiringBuilds: { builds: retiringBuilds.builds ?? {} },
+    };
   }
 
   // Persisted by the reconcile loop each cycle so deploy-time reserve/release
@@ -439,6 +476,12 @@ export class CapacityStateStore {
     observedManagedVcpu: number;
     pendingLedgerVcpu: number;
     allocations: Record<string, number>;
+    // Ledger v2 Phase A (retirement-v2 §3.2): the TTL'd grant book, written
+    // alongside `allocations` in the SAME generation-fenced transaction on
+    // the SAME item — single-item transactionality, no table migration.
+    // Admission does not read it yet (the flip is Phase B, per-env flag,
+    // explicitly not this wave).
+    grants: Record<string, CapacityGrant>;
     inventoryHash: string;
     now: number;
   }) {
@@ -468,12 +511,13 @@ export class CapacityStateStore {
               Key: itemKey(this.config, "CAPACITY_LEDGER"),
               ConditionExpression: "generation = :generation",
               UpdateExpression:
-                "SET generation = :nextGeneration, managedCommittedVcpu = :managedCommittedVcpu, allocations = :allocations, inventoryHash = :inventoryHash, updatedAt = :now, pendingCycleId = :cycleId",
+                "SET generation = :nextGeneration, managedCommittedVcpu = :managedCommittedVcpu, allocations = :allocations, grants = :grants, inventoryHash = :inventoryHash, updatedAt = :now, pendingCycleId = :cycleId",
               ExpressionAttributeValues: encode({
                 ":generation": params.ledger.generation,
                 ":nextGeneration": nextGeneration,
                 ":managedCommittedVcpu": nextManagedCommittedVcpu,
                 ":allocations": params.allocations,
+                ":grants": params.grants,
                 ":inventoryHash": params.inventoryHash,
                 ":now": params.now,
                 ":cycleId": params.cycleId,
@@ -1005,18 +1049,53 @@ export class CapacityStateStore {
     return decodeItem<TemporalDrainRecord>(response.Item);
   }
 
-  // One RETIREMENT record per SERVICE of a DRAINED build, fenced by the same
-  // authority/ledger/cycle ConditionChecks as putDrainIntent: the intent is
-  // observable in the drains table before any actuation happens. Terminal
-  // records (APPLIED/FAILED) are overwritable so a service that resurfaces
-  // (e.g. a failed verify followed by re-selection) mints a fresh intent.
-  async putRetirementIntent(params: {
-    record: TemporalRetirementRecord;
+  // ─── Retirement v2 marker ops (design doc 2026-07-18 §4.2) ───
+  // Each op is ONE TransactWrite: an authority ConditionCheck (generation +
+  // writerKind — the fence shape shared with every other fenced write) plus a
+  // conditional update of the RETIRING_BUILDS entry. Deliberately NO
+  // RECONCILER cycle fence: these are data-plane writes that land outside
+  // cycles, exactly like admitReservation (precedent for out-of-cycle ledger
+  // writes bumping the generation).
+
+  // Terminal-sibling prune condition: each pruned buildId is asserted still
+  // terminal in the same transaction, so a concurrent begin re-opening a
+  // sibling between our snapshot read and this write fails the transaction
+  // (benign CCF, retried) instead of silently deleting a fresh OPEN entry.
+  private retirementPruneClauses(pruneBuildIds: string[]) {
+    const names: Record<string, string> = {};
+    const conditions: string[] = [];
+    const removes: string[] = [];
+    pruneBuildIds.forEach((buildId, index) => {
+      const alias = `#prune${index}`;
+      names[alias] = buildId;
+      conditions.push(
+        `(attribute_not_exists(builds.${alias}) OR builds.${alias}.#state <> :open)`,
+      );
+      removes.push(`builds.${alias}`);
+    });
+    return { names, conditions, removes };
+  }
+
+  // T0 BEGIN: make the burial intent durable (I7) and take single-writer
+  // ownership of the build (I2). The entry condition admits absent, terminal,
+  // expired, or same-intentId entries; a FOREIGN live intentId fails the
+  // condition — another run owns the build and the caller defers it
+  // (overlap-safe across the cleanup cron/dispatch concurrency groups).
+  async beginRetirement(params: {
+    authorityGeneration: number;
+    buildId: string;
+    entry: Omit<RetiringBuildEntry, "state" | "createdAt" | "terminalReason">;
+    pruneBuildIds: string[];
     now: number;
   }) {
-    const ttl =
-      Math.floor(params.record.verifyDeadline / 1_000) +
-      this.config.auditTtlSeconds;
+    const prune = this.retirementPruneClauses(
+      params.pruneBuildIds.filter((buildId) => buildId !== params.buildId),
+    );
+    const entry: RetiringBuildEntry = {
+      ...params.entry,
+      state: "OPEN",
+      createdAt: params.now,
+    };
     await this.client.send(
       new TransactWriteItemsCommand({
         TransactItems: [
@@ -1027,49 +1106,38 @@ export class CapacityStateStore {
               ConditionExpression:
                 "generation = :generation AND writerKind = :writer",
               ExpressionAttributeValues: encode({
-                ":generation": params.record.authorityGeneration,
+                ":generation": params.authorityGeneration,
                 ":writer": "STEP_FUNCTIONS_LAMBDA",
               }),
             },
           },
           {
-            ConditionCheck: {
+            Update: {
               TableName: this.config.tableName,
-              Key: itemKey(this.config, "CAPACITY_LEDGER"),
-              ConditionExpression: "generation = :generation",
+              Key: itemKey(this.config, "RETIRING_BUILDS"),
+              ConditionExpression: [
+                "(attribute_not_exists(builds.#build) OR builds.#build.#state IN (:buried, :aborted) OR builds.#build.expiresAt < :now OR builds.#build.intentId = :mine)",
+                ...prune.conditions,
+              ].join(" AND "),
+              UpdateExpression:
+                `SET builds.#build = :entry, updatedAt = :now` +
+                (prune.removes.length > 0
+                  ? ` REMOVE ${prune.removes.join(", ")}`
+                  : ""),
+              ExpressionAttributeNames: {
+                "#build": params.buildId,
+                "#state": "state",
+                ...prune.names,
+              },
+              // ":open" is only referenced by the prune clauses; DynamoDB
+              // rejects unused ExpressionAttributeValues.
               ExpressionAttributeValues: encode({
-                ":generation": params.record.ledgerGeneration,
-              }),
-            },
-          },
-          {
-            ConditionCheck: {
-              TableName: this.config.tableName,
-              Key: itemKey(this.config, "RECONCILER"),
-              ConditionExpression:
-                "cycleId = :cycleId AND authorityGeneration = :authorityGeneration AND lockExpiresAt >= :now",
-              ExpressionAttributeValues: encode({
-                ":cycleId": params.record.cycleId,
-                ":authorityGeneration": params.record.authorityGeneration,
+                ":entry": entry,
+                ":buried": "BURIED",
+                ":aborted": "ABORTED",
+                ...(prune.conditions.length > 0 ? { ":open": "OPEN" } : {}),
+                ":mine": params.entry.intentId,
                 ":now": params.now,
-              }),
-            },
-          },
-          {
-            Put: {
-              TableName: this.config.drainTableName,
-              Item: encode({
-                PK: this.config.controlPartitionKey,
-                SK: getTemporalRetirementSortKey(params.record.serviceArn),
-                ...params.record,
-                ttl,
-              }),
-              ConditionExpression:
-                "attribute_not_exists(PK) OR #state IN (:applied, :failed)",
-              ExpressionAttributeNames: { "#state": "state" },
-              ExpressionAttributeValues: encode({
-                ":applied": "APPLIED",
-                ":failed": "FAILED",
               }),
             },
           },
@@ -1078,51 +1146,32 @@ export class CapacityStateStore {
     );
   }
 
-  async listActiveRetirements() {
-    const retirements: TemporalRetirementRecord[] = [];
-    let exclusiveStartKey: Record<string, AttributeValue> | undefined;
-    do {
-      const response = await this.client.send(
-        new QueryCommand({
-          TableName: this.config.drainTableName,
-          KeyConditionExpression: "PK = :pk AND begins_with(SK, :prefix)",
-          ExpressionAttributeValues: encode({
-            ":pk": this.config.controlPartitionKey,
-            ":prefix": "RETIREMENT#",
-          }),
-          ExclusiveStartKey: exclusiveStartKey,
-          ConsistentRead: true,
-        }),
-      );
-      retirements.push(
-        ...(response.Items ?? [])
-          .map((item) => decodeItem<TemporalRetirementRecord>(item))
-          .filter((item): item is TemporalRetirementRecord => Boolean(item))
-          .filter((item) => item.state === "ZEROING"),
-      );
-      exclusiveStartKey = response.LastEvaluatedKey;
-    } while (exclusiveStartKey);
-    return retirements;
-  }
-
-  // The batch analogue of claimProtectedDecrease: ONE ledger transaction per
-  // retired service (not one per task) releasing its entire allocation. The
-  // committed value is computed client-side (clamped at zero) and written
-  // under the ledger-generation condition, exactly like claimCapacityPlan —
-  // no arithmetic ConditionExpression that could brick on drift.
-  async claimRetirementRelease(params: {
-    record: TemporalRetirementRecord;
-    cycleId: string;
+  // T3 RELEASE: the deploy-admission unfreeze. Same ledger arm as R1's
+  // claimRetirementRelease (gen-fenced, values computed CLIENT-SIDE and
+  // clamped at zero — no arithmetic ConditionExpression that could brick on
+  // drift), minus the RECONCILER cycle fence, plus the Phase A dual-book:
+  // allocations[arn] clamps to 0 AND grants[arn] is deleted in the same
+  // generation-fenced transaction (§3.2 — both books conserved throughout).
+  // The marker stamp (releasedLedgerGeneration) rides the same transaction,
+  // so a crash can never separate the release from its idempotency stamp.
+  async releaseRetirementLedger(params: {
     authorityGeneration: number;
     ledger: CapacityLedger;
+    buildId: string;
+    intentId: string;
+    serviceArn: string;
     releasedVcpu: number;
     now: number;
   }) {
     const nextGeneration = params.ledger.generation + 1;
     const allocations = {
       ...params.ledger.allocations,
-      [params.record.serviceArn]: 0,
+      [params.serviceArn]: 0,
     };
+    const grants: Record<string, CapacityGrant> = {
+      ...params.ledger.grants,
+    };
+    delete grants[params.serviceArn];
     const nextManagedCommittedVcpu = Math.max(
       0,
       params.ledger.managedCommittedVcpu - params.releasedVcpu,
@@ -1148,44 +1197,33 @@ export class CapacityStateStore {
               Key: itemKey(this.config, "CAPACITY_LEDGER"),
               ConditionExpression: "generation = :generation",
               UpdateExpression:
-                "SET generation = :nextGeneration, managedCommittedVcpu = :managedCommittedVcpu, allocations = :allocations, updatedAt = :now, pendingCycleId = :cycleId",
+                "SET generation = :nextGeneration, managedCommittedVcpu = :managedCommittedVcpu, allocations = :allocations, grants = :grants, updatedAt = :now",
               ExpressionAttributeValues: encode({
                 ":generation": params.ledger.generation,
                 ":nextGeneration": nextGeneration,
                 ":managedCommittedVcpu": nextManagedCommittedVcpu,
                 ":allocations": allocations,
-                ":now": params.now,
-                ":cycleId": params.cycleId,
-              }),
-            },
-          },
-          {
-            ConditionCheck: {
-              TableName: this.config.tableName,
-              Key: itemKey(this.config, "RECONCILER"),
-              ConditionExpression:
-                "cycleId = :cycleId AND authorityGeneration = :authorityGeneration AND lockExpiresAt >= :now",
-              ExpressionAttributeValues: encode({
-                ":cycleId": params.cycleId,
-                ":authorityGeneration": params.authorityGeneration,
+                ":grants": grants,
                 ":now": params.now,
               }),
             },
           },
           {
             Update: {
-              TableName: this.config.drainTableName,
-              Key: itemKey(
-                this.config,
-                getTemporalRetirementSortKey(params.record.serviceArn),
-              ),
-              ConditionExpression: "intentId = :intentId AND #state = :zeroing",
+              TableName: this.config.tableName,
+              Key: itemKey(this.config, "RETIRING_BUILDS"),
+              ConditionExpression:
+                "builds.#build.#state = :open AND builds.#build.intentId = :mine AND attribute_not_exists(builds.#build.services.#arn.releasedLedgerGeneration)",
               UpdateExpression:
-                "SET releasedLedgerGeneration = :nextGeneration, updatedAt = :now",
-              ExpressionAttributeNames: { "#state": "state" },
+                "SET builds.#build.services.#arn.releasedLedgerGeneration = :nextGeneration, updatedAt = :now",
+              ExpressionAttributeNames: {
+                "#build": params.buildId,
+                "#state": "state",
+                "#arn": params.serviceArn,
+              },
               ExpressionAttributeValues: encode({
-                ":intentId": params.record.intentId,
-                ":zeroing": "ZEROING",
+                ":open": "OPEN",
+                ":mine": params.intentId,
                 ":nextGeneration": nextGeneration,
                 ":now": params.now,
               }),
@@ -1194,43 +1232,117 @@ export class CapacityStateStore {
         ],
       }),
     );
-    return {
-      ledger: {
-        ...params.ledger,
-        generation: nextGeneration,
-        managedCommittedVcpu: nextManagedCommittedVcpu,
-        allocations,
-      } satisfies CapacityLedger,
-    };
+    return nextGeneration;
   }
 
-  async completeRetirement(params: {
-    record: TemporalRetirementRecord;
-    terminalState: Extract<
-      TemporalRetirementRecord["state"],
-      "APPLIED" | "FAILED"
-    >;
-    reason?: string;
+  // Terminal edges (I5): ABORTED records its typed forfeiture — stamped
+  // releases stand (no claw-back; a re-lived build's next scale-up is a
+  // fresh grant) and unstamped releases are NOT owed (an aborted build is
+  // live-or-replannable; its capacity is re-observed). BURIED closes the
+  // marker after the version deletion.
+  async abortRetirement(params: {
+    authorityGeneration: number;
+    buildId: string;
+    intentId: string;
+    reason: RetirementAbortReason;
     now: number;
   }) {
     await this.client.send(
-      new UpdateItemCommand({
-        TableName: this.config.drainTableName,
-        Key: itemKey(
-          this.config,
-          getTemporalRetirementSortKey(params.record.serviceArn),
-        ),
-        ConditionExpression: "intentId = :intentId AND #state = :zeroing",
-        UpdateExpression:
-          "SET #state = :terminalState, terminalReason = :reason, appliedAt = :now",
-        ExpressionAttributeNames: { "#state": "state" },
-        ExpressionAttributeValues: encode({
-          ":intentId": params.record.intentId,
-          ":zeroing": "ZEROING",
-          ":terminalState": params.terminalState,
-          ":reason": params.reason ?? params.terminalState,
-          ":now": params.now,
-        }),
+      new TransactWriteItemsCommand({
+        TransactItems: [
+          {
+            ConditionCheck: {
+              TableName: this.config.tableName,
+              Key: itemKey(this.config, "WRITER_AUTHORITY"),
+              ConditionExpression:
+                "generation = :generation AND writerKind = :writer",
+              ExpressionAttributeValues: encode({
+                ":generation": params.authorityGeneration,
+                ":writer": "STEP_FUNCTIONS_LAMBDA",
+              }),
+            },
+          },
+          {
+            Update: {
+              TableName: this.config.tableName,
+              Key: itemKey(this.config, "RETIRING_BUILDS"),
+              ConditionExpression:
+                "builds.#build.#state = :open AND builds.#build.intentId = :mine",
+              UpdateExpression:
+                "SET builds.#build.#state = :aborted, builds.#build.terminalReason = :reason, updatedAt = :now",
+              ExpressionAttributeNames: {
+                "#build": params.buildId,
+                "#state": "state",
+              },
+              ExpressionAttributeValues: encode({
+                ":open": "OPEN",
+                ":aborted": "ABORTED",
+                ":mine": params.intentId,
+                ":reason": params.reason,
+                ":now": params.now,
+              }),
+            },
+          },
+        ],
+      }),
+    );
+  }
+
+  // T7 CLOSE: marker closure discharges the last obligation; terminal
+  // siblings are pruned here as well as at begin so the map stays bounded by
+  // the verb's per-run floors without a per-entry TTL (§4.1).
+  async closeRetirement(params: {
+    authorityGeneration: number;
+    buildId: string;
+    intentId: string;
+    pruneBuildIds: string[];
+    now: number;
+  }) {
+    const prune = this.retirementPruneClauses(
+      params.pruneBuildIds.filter((buildId) => buildId !== params.buildId),
+    );
+    await this.client.send(
+      new TransactWriteItemsCommand({
+        TransactItems: [
+          {
+            ConditionCheck: {
+              TableName: this.config.tableName,
+              Key: itemKey(this.config, "WRITER_AUTHORITY"),
+              ConditionExpression:
+                "generation = :generation AND writerKind = :writer",
+              ExpressionAttributeValues: encode({
+                ":generation": params.authorityGeneration,
+                ":writer": "STEP_FUNCTIONS_LAMBDA",
+              }),
+            },
+          },
+          {
+            Update: {
+              TableName: this.config.tableName,
+              Key: itemKey(this.config, "RETIRING_BUILDS"),
+              ConditionExpression: [
+                "builds.#build.#state = :open AND builds.#build.intentId = :mine",
+                ...prune.conditions,
+              ].join(" AND "),
+              UpdateExpression:
+                `SET builds.#build.#state = :buried, updatedAt = :now` +
+                (prune.removes.length > 0
+                  ? ` REMOVE ${prune.removes.join(", ")}`
+                  : ""),
+              ExpressionAttributeNames: {
+                "#build": params.buildId,
+                "#state": "state",
+                ...prune.names,
+              },
+              ExpressionAttributeValues: encode({
+                ":open": "OPEN",
+                ":buried": "BURIED",
+                ":mine": params.intentId,
+                ":now": params.now,
+              }),
+            },
+          },
+        ],
       }),
     );
   }

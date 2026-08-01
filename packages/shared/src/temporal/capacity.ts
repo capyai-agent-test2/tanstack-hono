@@ -26,21 +26,14 @@ export const TEMPORAL_SCALE_IN_INTENT_TIMEOUT_SECONDS = 20 * 60;
 export const TEMPORAL_SCALE_IN_VERIFY_TIMEOUT_SECONDS = 2 * 60;
 export const TEMPORAL_SCALE_IN_MAX_WAVE_FRACTION = 0.25;
 export const TEMPORAL_SCALE_IN_SLOT_UTILIZATION = 0.3;
-// Batch retirement lane (DRAINED builds): after the lane zeroes a service's
-// desiredCount, the running count must be observed at zero within this window
-// or the RETIREMENT record flips to a typed FAILED — never a silent re-loop.
-// DRAINED workers hold no work, so this needs no shutdown-grace coupling.
-export const TEMPORAL_RETIREMENT_VERIFY_TIMEOUT_SECONDS = 10 * 60;
-// Sanity floor for NEW retirement intents per reconcile cycle, counted in
-// builds (the iac retire verb's RETIRE_MAX_BUILDS_PER_RUN doctrine: an absurd
-// batch is evidence of a wrong worldview, never a big cleanup day; refuse and
-// make a human look). Deliberately a named constant, not an env knob.
-// BACKLOG-ERA CEILING (2026-07-18, supervised): the pre-R1 starvation left
-// verified backlogs of 15 (prod) / 22 (staging) / 46 (dev) drained builds —
-// counted by hand against Temporal drainage status before raising. Restore to
-// 12 once all three cleanup.yml legs run green (tracked in the tightening
-// list); a steady-state cycle should never see more than a handful.
-export const TEMPORAL_RETIREMENT_MAX_BUILDS_PER_CYCLE = 64;
+// Ledger v2 grant TTL (retirement-v2 §3.1, ruled 2026-07-18): a capacity
+// grant written by the plan transaction charges admission only until ECS
+// either delivers it (observed >= granted) or this TTL expires — sized at the
+// worst plausible service-update + task-launch latency. Expiry emits the
+// typed GrantExpired signal today's never-shrinking allocations ratchet
+// silently absorbed. Consumed by the controller runtime, so it lives here
+// (map=facts/policy=permissions: iac policy is verb-only).
+export const TEMPORAL_CAPACITY_GRANT_TTL_MS = 15 * 60_000;
 
 export const TEMPORAL_STABLE_POOL_IDS = [
   "parent",
@@ -86,36 +79,57 @@ export type TemporalDrainRecord = {
   terminalReason?: string;
 };
 
-// Batch retirement of a DRAINED build's service: one record per SERVICE (not
-// per task), disjoint from the SCALE_IN/MAINTENANCE per-task drain records —
-// the sort key namespace (RETIREMENT#) keeps it invisible to the live
-// protected-scale-in lane. ZEROING covers intent through actuation; APPLIED
-// means desired=0 and running=0 were observed (or the service was deleted by
-// the retire verb); FAILED carries a typed terminalReason.
-export type TemporalRetirementState = "ZEROING" | "APPLIED" | "FAILED";
+// ─── Retirement v2 keep-out marker (design doc 2026-07-18 §4) ───
+//
+// One RETIRING_BUILDS control item per environment, fourth member of the
+// controller's readControlSnapshot TransactGet. An OPEN, unexpired entry means
+// the iac `retire` verb owns that build's burial and the controller must keep
+// out (I2 single-writer): the build's services leave demand construction,
+// allocation grants, live scale-in, and maintenance, and are exempt from the
+// active-build fail-loud checks (I8). The closed state set is I4: BURIED and
+// ABORTED are terminal and pruned by the next begin/close; lapse (expiresAt
+// passing) is not a stored state — the controller derives it from the clock,
+// and a later verb run re-begins with a fresh intentId.
+export type RetirementMarkerState = "OPEN" | "BURIED" | "ABORTED";
 
-export type TemporalRetirementRecord = {
-  kind: "RETIREMENT";
-  serviceArn: string;
-  clusterArn: string;
-  poolId: TemporalStablePoolId;
-  buildId: string;
-  intentId: string;
-  cycleId: string;
-  authorityGeneration: number;
-  ledgerGeneration: number;
-  priorDesiredCount: number;
-  state: TemporalRetirementState;
-  createdAt: number;
-  // Deadline for observing running=0 after the zero write; expiry flips the
-  // record to FAILED with a typed reason.
-  verifyDeadline: number;
-  // Set by the ledger-release transaction; its absence on a ZEROING record
-  // means the allocation release is still owed (crash/contention between the
-  // ECS zero write and the ledger transaction) and must be resumed.
+// Typed abort reasons (I5: every terminal edge discharges or forfeits with a
+// typed reason — ABORTED without one is unrepresentable at the write).
+export type RetirementAbortReason =
+  // T1: the fresh pre-zero Temporal inspection refused to assert DRAINED.
+  | "TEMPORAL_NOT_DRAINED"
+  // T5: drain regressed between zero and service deletion (break-glass
+  // rollback); stamped ledger releases stand — no claw-back.
+  | "BUILD_STATE_REGRESSED"
+  // Operator-dispatched abort ahead of a rollback to a retiring build.
+  | "OPERATOR_REQUESTED";
+
+export type RetiringBuildService = {
+  priorDesired: number;
+  // T3 idempotency stamp, set in the same transaction as the ledger release.
+  // ABSENT on an OPEN entry ⇒ the release is still owed (I5 obligation).
   releasedLedgerGeneration?: number;
-  appliedAt?: number;
+};
+
+export type RetiringBuildEntry = {
+  // Verb-run UUID: idempotency within a run + the overlap fence across runs
+  // (a foreign live intentId defers the build, cleanup.yml overlap safety).
+  intentId: string;
+  deploymentName: string;
+  environment: string;
+  // Keyed by service ARN.
+  services: Record<string, RetiringBuildService>;
+  state: RetirementMarkerState;
+  createdAt: number;
+  // createdAt + RETIRE_MARKER_TTL_MS (verb policy). Past this the controller
+  // resumes ownership — harmless for a DRAINED build (floor 0) and the
+  // anti-F1 guard against a crashed verb freezing a build forever.
+  expiresAt: number;
+  // Typed; REQUIRED on ABORTED (enforced by the abort op's write shape).
   terminalReason?: string;
+};
+
+export type RetiringBuilds = {
+  builds: Record<string, RetiringBuildEntry>;
 };
 
 export type TemporalQueueSlotVector = {
@@ -448,26 +462,27 @@ export function getTemporalMaintenanceSortKey(serviceArn: string) {
   return `MAINTENANCE#${serviceName}`;
 }
 
-// Typed identity guard (no-bare-throw doctrine, matching the shared
-// package's SecretEncryptionError shape): a malformed service ARN here means
-// the ECS inventory feeding the retirement lane is corrupt — a deterministic
-// internal invariant, never an outcome callers branch on.
-export class TemporalRetirementIdentityError extends Error {
-  readonly serviceArn: string;
-
-  constructor(serviceArn: string) {
-    super(
-      `Invalid ECS service ARN for Temporal retirement identity: ${serviceArn}`,
+// Pool identity from a per-build worker service name/ARN, for retirement
+// release pricing (T3: managedCommittedVcpu decrement = priorDesired ×
+// taskVcpu). Marker entries carry ARNs, not pool ids, so the release op
+// derives the pool from the service-name segment. Unknown segments (frozen
+// legacy pools that never entered the capacity-managed inventory) resolve to
+// null and price at zero — conservative, and managedCommittedVcpu recomputes
+// wholesale from observation at the next plan write regardless.
+export function temporalPoolIdForServiceName(
+  serviceNameOrArn: string,
+): TemporalStablePoolId | null {
+  const serviceName = serviceNameOrArn.split("/").at(-1) ?? "";
+  const match =
+    /^capy-temporal-worker-.+-([a-z0-9-]+)-service-[0-9a-f]{12}$/.exec(
+      serviceName,
     );
-    this.name = "TemporalRetirementIdentityError";
-    this.serviceArn = serviceArn;
+  if (!match) return null;
+  const segment = match[1];
+  for (const poolId of TEMPORAL_STABLE_POOL_IDS) {
+    if (TEMPORAL_STABLE_POOLS[poolId].serviceNameSegment === segment) {
+      return poolId;
+    }
   }
-}
-
-export function getTemporalRetirementSortKey(serviceArn: string) {
-  const serviceName = serviceArn.split("/").at(-1);
-  if (!serviceName || !/^[a-zA-Z0-9_-]+$/.test(serviceName)) {
-    throw new TemporalRetirementIdentityError(serviceArn);
-  }
-  return `RETIREMENT#${serviceName}`;
+  return null;
 }

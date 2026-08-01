@@ -22,7 +22,6 @@ import {
   unpackCycleAudit,
   unpackReconcilerMaps,
 } from "./state.js";
-import type { TemporalRetirementRecord } from "@capy/shared/temporal/capacity";
 import type {
   CapacityReservation,
   ControllerConfig,
@@ -275,6 +274,7 @@ describe("capacity reservation transaction", () => {
           updatedAt: now,
         },
         reconciler: { capability: "PROTECTED_SCALE_IN" },
+        retiringBuilds: { builds: {} },
       })
       .mockResolvedValueOnce({
         authority: {
@@ -293,6 +293,7 @@ describe("capacity reservation transaction", () => {
           updatedAt: now,
         },
         reconciler: { capability: "PROTECTED_SCALE_IN" },
+        retiringBuilds: { builds: {} },
       });
     const release = vi
       .spyOn(store, "releaseReservation")
@@ -401,7 +402,12 @@ describe("capacity reservation transaction", () => {
     );
   });
 
-  it("fences the retirement intent on authority, ledger, and cycle lock before the record write", async () => {
+  // ─── Retirement v2 marker op fences (design doc 2026-07-18 §4.2) ───
+
+  const markerArn =
+    "arn:aws:ecs:us-west-2:123456789012:service/cluster/capy-temporal-worker-dev-parent-service-aaaaaaaaaaaa";
+
+  it("begins a marker under the authority fence, admitting only absent/terminal/expired/own entries", async () => {
     const commands: unknown[] = [];
     const client = {
       async send(command: unknown) {
@@ -411,57 +417,56 @@ describe("capacity reservation transaction", () => {
     } as DynamoDBClient;
     const store = new CapacityStateStore(config, client);
     const now = Date.now();
-    const record: TemporalRetirementRecord = {
-      kind: "RETIREMENT",
-      serviceArn:
-        "arn:aws:ecs:us-west-2:123456789012:service/cluster/drained-service",
-      clusterArn: "cluster",
-      poolId: "parent",
-      buildId: "build-1",
-      intentId: "retire-1",
-      cycleId: "cycle-1",
-      authorityGeneration: 7,
-      ledgerGeneration: 9,
-      priorDesiredCount: 3,
-      state: "ZEROING",
-      createdAt: now,
-      verifyDeadline: now + 10 * 60_000,
-    };
 
-    await store.putRetirementIntent({ record, now });
+    await store.beginRetirement({
+      authorityGeneration: 7,
+      buildId: "build-1",
+      entry: {
+        intentId: "run-1",
+        deploymentName: "capy-temporal-worker-dev",
+        environment: "dev",
+        services: { [markerArn]: { priorDesired: 3 } },
+        expiresAt: now + 45 * 60_000,
+      },
+      pruneBuildIds: ["build-terminal"],
+      now,
+    });
 
     const input = (commands[0] as TransactWriteItemsCommand).input;
-    expect(input.TransactItems).toHaveLength(4);
+    expect(input.TransactItems).toHaveLength(2);
     const authorityCheck = input.TransactItems?.[0]?.ConditionCheck;
-    const ledgerCheck = input.TransactItems?.[1]?.ConditionCheck;
-    const reconcilerCheck = input.TransactItems?.[2]?.ConditionCheck;
-    const recordPut = input.TransactItems?.[3]?.Put;
     expect(authorityCheck?.ConditionExpression).toBe(
       "generation = :generation AND writerKind = :writer",
     );
     expect(unmarshall(authorityCheck?.ExpressionAttributeValues ?? {})).toEqual(
       { ":generation": 7, ":writer": "STEP_FUNCTIONS_LAMBDA" },
     );
-    expect(ledgerCheck?.ConditionExpression).toBe("generation = :generation");
-    expect(unmarshall(ledgerCheck?.ExpressionAttributeValues ?? {})).toEqual({
-      ":generation": 9,
+    const markerUpdate = input.TransactItems?.[1]?.Update;
+    expect(unmarshall(markerUpdate?.Key ?? {}).SK).toBe("RETIRING_BUILDS");
+    // Begin guard: absent | terminal | expired | same intentId — a FOREIGN
+    // live intentId fails and the caller defers the build (overlap fence).
+    expect(markerUpdate?.ConditionExpression).toContain(
+      "attribute_not_exists(builds.#build) OR builds.#build.#state IN (:buried, :aborted) OR builds.#build.expiresAt < :now OR builds.#build.intentId = :mine",
+    );
+    // Terminal-sibling prune is guarded: the pruned entry must still be
+    // non-OPEN in the same transaction (no clobbering a concurrent re-begin).
+    expect(markerUpdate?.ConditionExpression).toContain(
+      "attribute_not_exists(builds.#prune0) OR builds.#prune0.#state <> :open",
+    );
+    expect(markerUpdate?.UpdateExpression).toContain("REMOVE builds.#prune0");
+    expect(markerUpdate?.ExpressionAttributeNames?.["#prune0"]).toBe(
+      "build-terminal",
+    );
+    const values = unmarshall(markerUpdate?.ExpressionAttributeValues ?? {});
+    expect(values[":entry"]).toMatchObject({
+      intentId: "run-1",
+      state: "OPEN",
+      createdAt: now,
+      services: { [markerArn]: { priorDesired: 3 } },
     });
-    expect(reconcilerCheck?.ConditionExpression).toBe(
-      "cycleId = :cycleId AND authorityGeneration = :authorityGeneration AND lockExpiresAt >= :now",
-    );
-    expect(recordPut?.TableName).toBe(config.drainTableName);
-    const item = unmarshall(recordPut?.Item ?? {});
-    expect(item.SK).toBe("RETIREMENT#drained-service");
-    expect(item.state).toBe("ZEROING");
-    expect(item.priorDesiredCount).toBe(3);
-    // Terminal records are overwritable so a re-selected service can mint a
-    // fresh intent; an active ZEROING record is not.
-    expect(recordPut?.ConditionExpression).toBe(
-      "attribute_not_exists(PK) OR #state IN (:applied, :failed)",
-    );
   });
 
-  it("releases a retired service's whole allocation in one clamped ledger transaction", async () => {
+  it("never prunes the build being begun and omits :open when nothing is pruned", async () => {
     const commands: unknown[] = [];
     const client = {
       async send(command: unknown) {
@@ -471,43 +476,73 @@ describe("capacity reservation transaction", () => {
     } as DynamoDBClient;
     const store = new CapacityStateStore(config, client);
     const now = Date.now();
-    const record: TemporalRetirementRecord = {
-      kind: "RETIREMENT",
-      serviceArn:
-        "arn:aws:ecs:us-west-2:123456789012:service/cluster/drained-service",
-      clusterArn: "cluster",
-      poolId: "parent",
-      buildId: "build-1",
-      intentId: "retire-1",
-      cycleId: "cycle-1",
-      authorityGeneration: 7,
-      ledgerGeneration: 9,
-      priorDesiredCount: 3,
-      state: "ZEROING",
-      createdAt: now,
-      verifyDeadline: now + 10 * 60_000,
-    };
 
-    const released = await store.claimRetirementRelease({
-      record,
-      cycleId: "cycle-2",
+    await store.beginRetirement({
+      authorityGeneration: 7,
+      buildId: "build-1",
+      entry: {
+        intentId: "run-1",
+        deploymentName: "capy-temporal-worker-dev",
+        environment: "dev",
+        services: { [markerArn]: { priorDesired: 3 } },
+        expiresAt: now + 45 * 60_000,
+      },
+      // The build's own (terminal) entry must not be REMOVEd while being SET.
+      pruneBuildIds: ["build-1"],
+      now,
+    });
+
+    const markerUpdate = (commands[0] as TransactWriteItemsCommand).input
+      .TransactItems?.[1]?.Update;
+    expect(markerUpdate?.UpdateExpression).not.toContain("REMOVE");
+    // DynamoDB rejects unused ExpressionAttributeValues.
+    expect(
+      unmarshall(markerUpdate?.ExpressionAttributeValues ?? {})[":open"],
+    ).toBeUndefined();
+  });
+
+  it("releases the ledger, deletes the grant, and stamps the marker in one generation-fenced transaction", async () => {
+    const commands: unknown[] = [];
+    const client = {
+      async send(command: unknown) {
+        commands.push(command);
+        return {};
+      },
+    } as DynamoDBClient;
+    const store = new CapacityStateStore(config, client);
+    const now = Date.now();
+
+    const nextGeneration = await store.releaseRetirementLedger({
       authorityGeneration: 7,
       ledger: {
         generation: 9,
         managedCommittedVcpu: 4,
         activeReservationVcpu: 0,
-        allocations: { [record.serviceArn]: 6, other: 2 },
+        allocations: { [markerArn]: 6, other: 2 },
+        grants: {
+          [markerArn]: { vcpu: 6, expiresAt: now + 60_000 },
+          other: { vcpu: 2, expiresAt: now + 60_000 },
+        },
         inventoryHash: "inventory",
         updatedAt: now,
       },
+      buildId: "build-1",
+      intentId: "run-1",
+      serviceArn: markerArn,
       // More vCPU than the ledger still carries: the committed write must
-      // clamp at zero instead of failing an arithmetic condition forever.
+      // clamp at zero client-side instead of failing an arithmetic
+      // condition forever (the R1 no-brick posture, unchanged).
       releasedVcpu: 6,
       now,
     });
 
+    expect(nextGeneration).toBe(10);
     const input = (commands[0] as TransactWriteItemsCommand).input;
-    expect(input.TransactItems).toHaveLength(4);
+    expect(input.TransactItems).toHaveLength(3);
+    const authorityCheck = input.TransactItems?.[0]?.ConditionCheck;
+    expect(authorityCheck?.ConditionExpression).toBe(
+      "generation = :generation AND writerKind = :writer",
+    );
     const ledgerUpdate = input.TransactItems?.[1]?.Update;
     expect(ledgerUpdate?.ConditionExpression).toBe("generation = :generation");
     const ledgerValues = unmarshall(
@@ -515,26 +550,36 @@ describe("capacity reservation transaction", () => {
     );
     expect(ledgerValues[":nextGeneration"]).toBe(10);
     expect(ledgerValues[":managedCommittedVcpu"]).toBe(0);
+    // Phase A dual-book (§3.2): allocations clamp AND grant delete land in
+    // the same generation-fenced write — both books conserved throughout.
     expect(ledgerValues[":allocations"]).toEqual({
-      [record.serviceArn]: 0,
+      [markerArn]: 0,
       other: 2,
     });
-    const recordUpdate = input.TransactItems?.[3]?.Update;
-    expect(recordUpdate?.TableName).toBe(config.drainTableName);
-    expect(recordUpdate?.ConditionExpression).toBe(
-      "intentId = :intentId AND #state = :zeroing",
-    );
-    expect(recordUpdate?.UpdateExpression).toContain(
-      "releasedLedgerGeneration = :nextGeneration",
-    );
-    expect(released.ledger).toMatchObject({
-      generation: 10,
-      managedCommittedVcpu: 0,
-      allocations: { [record.serviceArn]: 0, other: 2 },
+    expect(ledgerValues[":grants"]).toEqual({
+      other: { vcpu: 2, expiresAt: now + 60_000 },
     });
+    // NO RECONCILER cycle fence: data-plane ops write outside cycles
+    // (admitReservation precedent).
+    const sortKeys = (input.TransactItems ?? []).map(
+      (item) =>
+        unmarshall(
+          item.ConditionCheck?.Key ?? item.Update?.Key ?? item.Put?.Item ?? {},
+        ).SK,
+    );
+    expect(sortKeys).not.toContain("RECONCILER");
+    const markerUpdate = input.TransactItems?.[2]?.Update;
+    expect(unmarshall(markerUpdate?.Key ?? {}).SK).toBe("RETIRING_BUILDS");
+    expect(markerUpdate?.ConditionExpression).toBe(
+      "builds.#build.#state = :open AND builds.#build.intentId = :mine AND attribute_not_exists(builds.#build.services.#arn.releasedLedgerGeneration)",
+    );
+    expect(markerUpdate?.UpdateExpression).toContain(
+      "builds.#build.services.#arn.releasedLedgerGeneration = :nextGeneration",
+    );
+    expect(markerUpdate?.ExpressionAttributeNames?.["#arn"]).toBe(markerArn);
   });
 
-  it("completes a retirement only from ZEROING and records the typed reason", async () => {
+  it("aborts only an OPEN entry it owns, recording the typed reason", async () => {
     const commands: unknown[] = [];
     const client = {
       async send(command: unknown) {
@@ -544,42 +589,106 @@ describe("capacity reservation transaction", () => {
     } as DynamoDBClient;
     const store = new CapacityStateStore(config, client);
     const now = Date.now();
-    const record: TemporalRetirementRecord = {
-      kind: "RETIREMENT",
-      serviceArn:
-        "arn:aws:ecs:us-west-2:123456789012:service/cluster/drained-service",
-      clusterArn: "cluster",
-      poolId: "parent",
-      buildId: "build-1",
-      intentId: "retire-1",
-      cycleId: "cycle-1",
-      authorityGeneration: 7,
-      ledgerGeneration: 9,
-      priorDesiredCount: 3,
-      state: "ZEROING",
-      createdAt: now,
-      verifyDeadline: now - 1_000,
-    };
 
-    await store.completeRetirement({
-      record,
-      terminalState: "FAILED",
-      reason: "RETIREMENT_RUNNING_NOT_STOPPED",
+    await store.abortRetirement({
+      authorityGeneration: 7,
+      buildId: "build-1",
+      intentId: "run-1",
+      reason: "BUILD_STATE_REGRESSED",
       now,
     });
 
-    const command = commands[0] as UpdateItemCommand;
-    expect(command).toBeInstanceOf(UpdateItemCommand);
-    expect(command.input.TableName).toBe(config.drainTableName);
-    expect(unmarshall(command.input.Key ?? {}).SK).toBe(
-      "RETIREMENT#drained-service",
+    const input = (commands[0] as TransactWriteItemsCommand).input;
+    expect(input.TransactItems).toHaveLength(2);
+    const markerUpdate = input.TransactItems?.[1]?.Update;
+    expect(markerUpdate?.ConditionExpression).toBe(
+      "builds.#build.#state = :open AND builds.#build.intentId = :mine",
     );
-    expect(command.input.ConditionExpression).toBe(
-      "intentId = :intentId AND #state = :zeroing",
+    const values = unmarshall(markerUpdate?.ExpressionAttributeValues ?? {});
+    expect(values[":aborted"]).toBe("ABORTED");
+    // I5: ABORTED without a typed reason is unrepresentable at the write.
+    expect(values[":reason"]).toBe("BUILD_STATE_REGRESSED");
+  });
+
+  it("closes only an OPEN entry it owns and prunes terminal siblings under guard", async () => {
+    const commands: unknown[] = [];
+    const client = {
+      async send(command: unknown) {
+        commands.push(command);
+        return {};
+      },
+    } as DynamoDBClient;
+    const store = new CapacityStateStore(config, client);
+    const now = Date.now();
+
+    await store.closeRetirement({
+      authorityGeneration: 7,
+      buildId: "build-1",
+      intentId: "run-1",
+      pruneBuildIds: ["build-old"],
+      now,
+    });
+
+    const input = (commands[0] as TransactWriteItemsCommand).input;
+    const markerUpdate = input.TransactItems?.[1]?.Update;
+    expect(markerUpdate?.ConditionExpression).toContain(
+      "builds.#build.#state = :open AND builds.#build.intentId = :mine",
     );
-    expect(
-      unmarshall(command.input.ExpressionAttributeValues ?? {})[":reason"],
-    ).toBe("RETIREMENT_RUNNING_NOT_STOPPED");
+    expect(markerUpdate?.ConditionExpression).toContain(
+      "attribute_not_exists(builds.#prune0) OR builds.#prune0.#state <> :open",
+    );
+    expect(markerUpdate?.UpdateExpression).toContain(
+      "builds.#build.#state = :buried",
+    );
+    expect(markerUpdate?.UpdateExpression).toContain("REMOVE builds.#prune0");
+  });
+
+  it("reads retiring-builds markers atomically with the control snapshot, tolerating absence", async () => {
+    const authorityItem = marshall({
+      generation: 3,
+      writerKind: "STEP_FUNCTIONS_LAMBDA",
+      transitionId: "t",
+      effectiveAt: 1,
+      checksum: "c",
+    });
+    const ledgerItem = marshall({
+      generation: 5,
+      managedCommittedVcpu: 0,
+      activeReservationVcpu: 0,
+      allocations: {},
+      inventoryHash: "i",
+      updatedAt: 1,
+    });
+    const reconcilerItem = marshall({ capability: "PROTECTED_SCALE_IN" });
+    let requestedKeys: string[] = [];
+    const client = {
+      async send(command: unknown) {
+        const transactGet = command as TransactGetItemsCommand;
+        requestedKeys = (transactGet.input.TransactItems ?? []).map(
+          (item) => unmarshall(item.Get?.Key ?? {}).SK as string,
+        );
+        return {
+          Responses: [
+            { Item: authorityItem },
+            { Item: ledgerItem },
+            { Item: reconcilerItem },
+            // RETIRING_BUILDS absent (pre-marker environment): must not fail.
+            {},
+          ],
+        };
+      },
+    } as DynamoDBClient;
+    const store = new CapacityStateStore(config, client);
+
+    const snapshot = await store.readControlSnapshot();
+
+    expect(requestedKeys).toEqual([
+      "WRITER_AUTHORITY",
+      "CAPACITY_LEDGER",
+      "RECONCILER",
+      "RETIRING_BUILDS",
+    ]);
+    expect(snapshot.retiringBuilds).toEqual({ builds: {} });
   });
 
   it("asserts the cycle lock alongside the ledger generation on the ready-drain fence", async () => {
